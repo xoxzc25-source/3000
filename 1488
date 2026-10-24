@@ -50,6 +50,15 @@
         за камерой теперь выполняется всегда, даже если проверки ниже прервали
         прицеливание (раньше корпус оставался выключенным и смотрел в 1 точку).
 
+        ФИКС (v15): 1) пол под игроком больше не пропадает, когда стреляешь
+        из меги чуть выше горизонта: у дула теперь безопасная зона
+        (CONFIG.MegaSafeDist = 18 studs) — волна сноса и ударная волна трогают
+        только то, что реально на пути луча дальше этой дистанции.
+        2) водяной знак «TG:RickPrimeScripts» в стиле системного уведомления
+        Roblox: появляется при запуске скрипта и при каждом открытии меню,
+        висит CONFIG.WatermarkTime = 7 секунд (текст меняется в CONFIG).
+        Плюс подпись TG:RickPrimeScripts в шапке меню.
+
         АНИМАЦИЯ v4 (механика):
                 раскрытие: глитч-морф с дрожью → вскидывание руки, лампы защёлкиваются
                 по очереди с микро-искрами → панели «носа» встают по очереди → шток
@@ -102,6 +111,12 @@ local CONFIG = {
         MegaMaxVolume = 60000, -- детали огромнее этого объёма (базплейты) не трогаем
         RestoreTime = 50, -- секунд, потом ВСЁ снесённое возвращается на свои места
         KnockRadius = 20, -- радиус ударной волны, раскидывающей детали
+        MegaSafeDist = 18, -- (v15) безопасная зона у дула: луч не трогает детали ближе этого (studs)
+
+        -- ВОДЯНОЙ ЗНАК (v15)
+        WatermarkTitle = "RickRoboArm",
+        WatermarkText = "скрипт сделан: TG:RickPrimeScripts",
+        WatermarkTime = 7, -- сколько секунд висит уведомление
 
         -- РЕЗАК (режим 3)
         CutAutoAt = 0.95, -- доля прочерченной линии, при которой стена падает сама
@@ -1892,7 +1907,7 @@ local function dissolvePart(part, intensity)
 end
 
 -- ударная волна раскидывает незакреплённые детали вокруг точки попадания
-local function knockParts(a, pos, radius)
+local function knockParts(a, pos, radius, okFilter) -- v15: okFilter — доп.фильтр деталей (безопасная зона меги)
         local params = OverlapParams.new()
         params.FilterType = Enum.RaycastFilterType.Exclude
         params.FilterDescendantsInstances = { a.char, a.model }
@@ -1903,7 +1918,8 @@ local function knockParts(a, pos, radius)
                         break
                 end
                 if not p.Anchored and not isCharacterPart(p) and not activeDissolves[p]
-                        and p:GetMass() < 1200 and p.Transparency < 0.95 then
+                        and p:GetMass() < 1200 and p.Transparency < 0.95
+                        and (not okFilter or okFilter(p)) then -- v15
                         local d = p.Position - pos
                         if d.Magnitude > 0.05 then
                                 scheduleRestore(p, "fling") -- v6: раскидаанная деталь вернётся на место
@@ -1914,6 +1930,12 @@ local function knockParts(a, pos, radius)
                         end
                 end
         end
+end
+
+-- v15: деталь сносится, только если её проекция на ЛУЧ не ближе MegaSafeDist к дула —
+-- пол под игроком и стены вокруг него больше не пропадают при стрельбе чуть выше горизонта
+local function megaBeamOk(part, origin, dir)
+        return (part.Position - origin):Dot(dir) >= CONFIG.MegaSafeDist
 end
 
 local function megaFire(a)
@@ -2019,7 +2041,8 @@ local function megaFire(a)
                                         break
                                 end
                                 if not activeDissolves[part] and not isCharacterPart(part)
-                                        and part.Transparency < 0.95 then
+                                        and part.Transparency < 0.95
+                                        and megaBeamOk(part, origin, dir) then -- v15
                                         local v = part.Size.X * part.Size.Y * part.Size.Z
                                         if v <= CONFIG.MegaMaxVolume then
                                                 dissolvePart(part, 0.45)
@@ -2028,7 +2051,9 @@ local function megaFire(a)
                                         end
                                 end
                         end
-                        knockParts(a, p)
+                        knockParts(a, p, nil, function(part) -- v15: не раскидываем безопасную зону у игрока
+                                return megaBeamOk(part, origin, dir)
+                        end)
                         if i % 2 == 0 then
                                 spawnShockwave(p, dir, (5 + math.random() * 2) * a.scale, i % 4 == 0 and Color3.new(1, 1, 1) or THEME.on)
                         end
@@ -2780,7 +2805,7 @@ local function buildGui()
                 Position = UDim2.new(0, 60, 0, 32),
                 Size = UDim2.new(1, -110, 0, 14),
                 BackgroundTransparency = 1,
-                Text = "C-137  •  cyber weapon",
+                Text = "C-137  •  TG:RickPrimeScripts",
                 Font = Enum.Font.Gotham,
                 TextSize = 11,
                 TextColor3 = MUTED,
@@ -2813,9 +2838,96 @@ local function buildGui()
                 portalDot.BackgroundColor3 = c
         end)
 
+        -- (v15) водяной знак: уведомление в стиле системного уведомления Roblox
+        -- («покупка геймпасса»): тёмная плашка выезжает сверху по центру,
+        -- висит CONFIG.WatermarkTime секунд и уезжает обратно
+        local wmFrame, wmToken = nil, 0
+        local function showWatermark()
+                wmToken += 1
+                local myToken = wmToken
+                if wmFrame then
+                        wmFrame:Destroy()
+                        wmFrame = nil
+                end
+                local f = make("Frame", {
+                        Name = "WatermarkNote",
+                        AnchorPoint = Vector2.new(0.5, 0),
+                        Position = UDim2.new(0.5, 0, 0, -80),
+                        Size = UDim2.fromOffset(330, 62),
+                        BackgroundColor3 = Color3.fromRGB(23, 26, 32),
+                        BackgroundTransparency = 0.04,
+                        Parent = gui,
+                })
+                wmFrame = f
+                corner(f, 14)
+                local wmStroke = make("UIStroke", { Thickness = 1.5, Transparency = 0.5, Parent = f })
+                local icon = make("Frame", {
+                        Position = UDim2.new(0, 12, 0.5, -19),
+                        Size = UDim2.fromOffset(38, 38),
+                        BackgroundColor3 = Color3.fromRGB(12, 15, 20),
+                        Parent = f,
+                })
+                round(icon)
+                local iconStroke = make("UIStroke", { Thickness = 2, Parent = icon })
+                onAccent(function(c)
+                        wmStroke.Color = c
+                        iconStroke.Color = c
+                end)
+                make("TextLabel", {
+                        Size = UDim2.fromScale(1, 1),
+                        BackgroundTransparency = 1,
+                        Text = "TG",
+                        Font = Enum.Font.GothamBlack,
+                        TextSize = 13,
+                        TextColor3 = TEXT,
+                        Parent = icon,
+                })
+                make("TextLabel", {
+                        Position = UDim2.new(0, 62, 0, 11),
+                        Size = UDim2.new(1, -74, 0, 18),
+                        BackgroundTransparency = 1,
+                        Text = CONFIG.WatermarkTitle,
+                        Font = Enum.Font.GothamBold,
+                        TextSize = 14,
+                        TextColor3 = TEXT,
+                        TextXAlignment = Enum.TextXAlignment.Left,
+                        Parent = f,
+                })
+                make("TextLabel", {
+                        Position = UDim2.new(0, 62, 0, 32),
+                        Size = UDim2.new(1, -74, 0, 15),
+                        BackgroundTransparency = 1,
+                        Text = CONFIG.WatermarkText,
+                        Font = Enum.Font.Gotham,
+                        TextSize = 12,
+                        TextColor3 = MUTED,
+                        TextXAlignment = Enum.TextXAlignment.Left,
+                        Parent = f,
+                })
+                uiTween(f, 0.45, { Position = UDim2.new(0.5, 0, 0, 76) }, Enum.EasingStyle.Quint, EOut)
+                task.delay(CONFIG.WatermarkTime, function()
+                        if myToken ~= wmToken or not f.Parent then
+                                return
+                        end
+                        uiTween(f, 0.4, { Position = UDim2.new(0.5, 0, 0, -80) }, Enum.EasingStyle.Quad, EIn)
+                        task.delay(0.45, function()
+                                if myToken == wmToken then
+                                        f:Destroy()
+                                        if wmFrame == f then
+                                                wmFrame = nil
+                                        end
+                                end
+                        end)
+                end)
+        end
+        task.defer(showWatermark) -- один раз показываем при загрузке скрипта
+
         local function setExpanded(v)
                 expanded = v
                 minBtn.Text = v and "–" or "+"
+                if v then
+                        showWatermark() -- (v15) водяной знак при каждом открытии меню
+                end
                 uiTween(window, 0.3, { Size = UDim2.fromOffset(WIN_W, v and FULL_H or HEAD_H) }, Enum.EasingStyle.Quint, EOut)
         end
         minBtn.Activated:Connect(function()
