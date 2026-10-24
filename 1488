@@ -1,0 +1,4020 @@
+--[[
+        ╔══════════════════════════════════════════════════════════════╗
+        ║   RICK ROBO ARM v7 — снос, резак и возврат через 50 сек       ║
+        ╚══════════════════════════════════════════════════════════════╝
+
+        КУДА ПОМЕСТИТЬ (один скрипт, больше ничего не нужно):
+                StarterPlayer > StarterPlayerScripts > LocalScript  (назови RickRoboArm)
+
+        УПРАВЛЕНИЕ:
+                G / большая кнопка в меню / кнопка «РУКА» на телефоне — превращение туда и обратно
+                T / кнопка «РЕЖИМ» — смена режима стрельбы по кругу
+                Мышь (на телефоне — центр экрана) — прицеливание
+                ЛКМ / кнопка огня на телефоне — стрелять (действие зависит от режима)
+                M — свернуть / развернуть меню
+
+        ТРИ РЕЖИМА СТРЕЛЬБЫ (клавиша T):
+                1. ПЛАЗМА      — быстрая очередь трассеров (как раньше).
+                2. МЕГА ЛАЗЕР  — зарядка, потом белый залп: от дула идёт ВОЛНА СНОСА,
+                                 которая растворяет ВСЁ на пути луча на 400 studs вперёд
+                                 (стены, полы, машины — всё, кроме персонажей).
+                                 Незакреплённые детали волна ещё и раскидывает.
+                3. РЕЗАК       — зажми огонь и веди лучом линию по стене: остаются
+                                 светящиеся метки и искры. Как только линия готова (или
+                                 отпустил кнопку) — РЕЖЕТСЯ ВСЯ СТЕНА: каждая деталь модели,
+                                 которую пересекает плоскость реза, разваливается на 2 части
+                                 с физикой, как при ограблении банка. Обломки растворяются
+                                 через 30 секунд.
+
+        ВОЗВРАТ (v6): всё, что снесено мега-лазером или резаком — и даже
+        раскидаанное ударной волной — через 50 секунд само возвращается
+        ровно на свои места (CONFIG.RestoreTime).
+
+        ЗВУКИ (v7): 8 звуков подобраны вручную (таблица SFX в начале скрипта),
+        громкость — ползунок «Громкость звуков» в меню (страница настроек).
+
+        ФИКС (v12): вылечены ошибки консоли «attempt to index nil with 'Color'»
+        в режиме резака: при переносе луча с одной детали на другую луч и звук
+        больше не уничтожаются посреди кадра (был полный сброс вместо мягкого).
+
+        ФИКС (v13): 1) мега со временем переставала сносить блоки — деталь после
+        возврата навсегда оставалась в списке растворённых и пропускалась волной;
+        теперь после возврата всё снова сносится. 2) резак падал с ошибкой
+        «Shape is not a valid member of UnionOperation» на юнионах карты —
+        теперь не-блоки (юнионы, меши, клинья) просто отрываются с физикой.
+
+        ФИКС (v14) — R15: 1) торс больше не «плавает»: на R15 анимации качали
+        суставом Waist, из-за чего пушка не держалась за курсором (на R6 торс
+        жёсткий, потому там всё было ровно) — пока рука раскрыта, сустав
+        зафиксирован. 2) «Следовать с корпусом» больше не застывает: слежение
+        за камерой теперь выполняется всегда, даже если проверки ниже прервали
+        прицеливание (раньше корпус оставался выключенным и смотрел в 1 точку).
+
+        АНИМАЦИЯ v4 (механика):
+                раскрытие: глитч-морф с дрожью → вскидывание руки, лампы защёлкиваются
+                по очереди с микро-искрами → панели «носа» встают по очереди → шток
+                выходит двумя рывками и БЬЁТ до упора с тряской камеры → крышка →
+                корпус врезается в упор → стволы телескопом → финал: весь неон
+                вспыхивает, с дула идёт ударная волна, тряска + рывок FOV.
+                складывание: аварийное мигание и гашение → стволы всасываются →
+                корпус бьётся в задний упор с отскоком → крышка с лязгом → шток
+                двумя рывками → панели захлопываются по очереди → замок-вспышка →
+                глитч-распад обратно в обычную руку.
+                пока оружие готово: пульсирует ядро, с кончиков стволов слетают искры.
+
+        Всё строится кодом из обычных Part'ов, без внешних ассетов.
+        Скрипт клиентский: все эффекты видишь только ты.
+]]
+
+local Players = game:GetService("Players")
+local TweenService = game:GetService("TweenService")
+local ContextActionService = game:GetService("ContextActionService")
+local UserInputService = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+local Debris = game:GetService("Debris")
+
+local player = Players.LocalPlayer
+
+--------------------------------------------------------------------
+-- НАСТРОЙКИ
+--------------------------------------------------------------------
+local CONFIG = {
+        ModelName = "RickRoboArm",
+        ToggleAction = "RickRoboArmToggle",
+        FireAction = "RickRoboArmFire",
+        ModeAction = "RickRoboArmMode",
+        Key = Enum.KeyCode.G,
+        GamepadKey = Enum.KeyCode.ButtonY,
+        ModeKey = Enum.KeyCode.T,
+        ModeGamepad = Enum.KeyCode.DPadRight,
+        MenuKey = Enum.KeyCode.M,
+        ButtonTitle = "РУКА",
+        FireCooldown = 0.22,
+        SizeFactor = 0.75, -- общий размер оружия (меньше — компактнее)
+
+        -- МЕГА ЛАЗЕР (режим 2)
+        MegaCharge = 0.55, -- сколько длится заряд перед залпом
+        MegaCooldown = 3, -- перезарядка мега-выстрела
+        MegaRange = 400, -- длина полосы сноса: растворяет ВСЁ на пути луча
+        MegaWidth = 11, -- радиус «коридора разрушения» вокруг луча
+        MegaWaveStep = 13, -- шаг волны сноса (studs)
+        MegaWaveDelay = 0.026, -- пауза между шагами волны (скорость сноса)
+        MegaMaxVolume = 60000, -- детали огромнее этого объёма (базплейты) не трогаем
+        RestoreTime = 50, -- секунд, потом ВСЁ снесённое возвращается на свои места
+        KnockRadius = 20, -- радиус ударной волны, раскидывающей детали
+
+        -- РЕЗАК (режим 3)
+        CutAutoAt = 0.95, -- доля прочерченной линии, при которой стена падает сама
+        CutMinProgress = 0.35, -- минимум прочерченного, чтобы разрезать при отпускании
+        CutNeedMin = 8, -- сколько studs линии достаточно для мелких деталей
+        CutNeedMax = 55, -- сколько studs линии достаточно для огромных стен
+        CutDotEvery = 0.22, -- шаг светящихся меток на линии реза (studs)
+        CutMaxTargets = 80, -- сколько деталей режется за один рез (вся модель сразу)
+        PiecesLifetime = 30, -- сколько секунд лежат половины, потом растворяются
+
+        -- ФЛИНГ (v8)
+        FlingAction = "RickRoboArmFling",
+        FlingKey = Enum.KeyCode.F,
+        FlingRange = 500, -- дальность луча прицела флинга
+        FlingFallback = 90, -- если под курсором никого: ищем ближайшего игрока в этом радиусе
+        FlingMaxTime = 2, -- сколько секунд максимум крутиться внутри цели
+        FlingCooldown = 4, -- пауза между флингами
+}
+
+-- меняются из меню
+local SETTINGS = {
+        aim = true,
+        face = true,
+        laser = true,
+        crosshair = true,
+        fpView = true, -- (v11) от 1 лица видны рука и ноги; торс и голова скрыты
+        sparks = true,
+        speed = 1,
+        sfx = 1, -- громкость звуков 0..1 (ползунок в меню)
+        mode = 1, -- активный режим стрельбы (1..#MODES)
+}
+
+local C = {
+        Steel = Color3.fromRGB(126, 132, 140),
+        DarkSteel = Color3.fromRGB(58, 62, 68),
+        LightSteel = Color3.fromRGB(176, 182, 190),
+        Plate = Color3.fromRGB(150, 156, 164),
+        Gold = Color3.fromRGB(214, 168, 52),
+        GoldDark = Color3.fromRGB(176, 132, 38),
+        White = Color3.fromRGB(236, 239, 241),
+        Cable = Color3.fromRGB(24, 26, 30),
+        OrangeOn = Color3.fromRGB(255, 140, 20),
+        OrangeOff = Color3.fromRGB(72, 34, 8),
+}
+
+local THEMES = {
+        { name = "Бирюза", color = Color3.fromRGB(0, 238, 255) },
+        { name = "Портал", color = Color3.fromRGB(80, 255, 60) },
+        { name = "Фиолет", color = Color3.fromRGB(190, 100, 255) },
+        { name = "Красный", color = Color3.fromRGB(255, 70, 80) },
+        { name = "Лёд", color = Color3.fromRGB(210, 235, 255) },
+}
+
+-- режимы стрельбы: 1 = плазма, 2 = мега-лазер (полоса сноса), 3 = резак
+local MODES = {
+        { name = "ПЛАЗМА", short = "ПЛАЗМА", btn = "ОГОНЬ", sub = "быстрая очередь" },
+        { name = "МЕГА ЛАЗЕР", short = "МЕГА", btn = "ЗАЛП", sub = "сносит всё на пути" },
+        { name = "РЕЗАК", short = "РЕЗАК", btn = "РЕЗАК", sub = "веди линию по стене" },
+}
+
+local function dim(c)
+        return c:Lerp(Color3.new(0, 0, 0), 0.84)
+end
+
+local THEME = { index = 1, on = THEMES[1].color, off = dim(THEMES[1].color) }
+
+local Quad, Back, Quart = Enum.EasingStyle.Quad, Enum.EasingStyle.Back, Enum.EasingStyle.Quart
+local EOut, EInOut = Enum.EasingDirection.Out, Enum.EasingDirection.InOut
+
+local PLATE_NAMES = { "PlateTop", "PlateRight", "PlateBottom", "PlateLeft" }
+
+--------------------------------------------------------------------
+-- СОСТОЯНИЕ
+--------------------------------------------------------------------
+local ui = { -- заглушки, GUI подменяет их позже
+        setStatus = function() end,
+        setRig = function() end,
+        progress = function() end,
+        crosshair = function() end,
+        tick = function() end,
+        theme = function() end,
+}
+
+local arm = nil -- данные текущей киберруки
+local building = false
+local transitionId = 0 -- растёт при каждом переключении: старая анимация сама прекращается
+local activeTweens = {}
+local fireHeld = false
+local sysConns = {}
+-- состояние лазерного резака (режим 3)
+local cut = {
+        part = nil, -- какая деталь режется
+        points = {}, -- точки прочерченной линии (мир)
+        faceAxis = 1, -- по какой грани режем
+        progress = 0, -- 0..1 насколько прорезана линия
+        lineAxis = 1, -- ось, вдоль которой прочерчена линия
+        sepAxis = 2, -- ось, поперёк которой деталь развалится
+        cutCoord = 0, -- где пройдёт разлом (вдоль sepAxis)
+        lineCenter = 0, -- центр линии (вдоль lineAxis)
+        lineLen = 0, -- длина прочерченной линии
+        att = nil, -- attachment конца луча
+        beam = nil, -- режущий луч
+        lastDot = nil,
+        lastSparkT = 0,
+        sparkPart = nil,
+        sparkEm = nil,
+}
+local cutReset, cutRelease -- определяются в разделе огня
+
+local destroyArm -- определяется ниже
+
+--------------------------------------------------------------------
+-- ТВИНЫ
+--------------------------------------------------------------------
+local function cancelTweens()
+        for t in pairs(activeTweens) do
+                t:Cancel()
+        end
+        table.clear(activeTweens)
+end
+
+-- твин анимации руки: учитывает скорость из меню, отменяется при переключении
+local function tween(inst, time, props, style, dir)
+        local t = TweenService:Create(inst, TweenInfo.new(time / SETTINGS.speed, style or Quad, dir or EOut), props)
+        activeTweens[t] = true
+        t.Completed:Once(function()
+                activeTweens[t] = nil
+        end)
+        t:Play()
+        return t
+end
+
+-- твин интерфейса: не отменяется и не зависит от скорости
+local function uiTween(inst, time, props, style, dir)
+        local t = TweenService:Create(inst, TweenInfo.new(time, style or Quad, dir or EOut), props)
+        t:Play()
+        return t
+end
+
+local function pause(sec)
+        task.wait(sec / SETTINGS.speed)
+end
+
+local function waitFor(t)
+        if t and t.PlaybackState ~= Enum.PlaybackState.Completed then
+                t.Completed:Wait()
+        end
+end
+
+--------------------------------------------------------------------
+-- ИСКРЫ
+--------------------------------------------------------------------
+local function makeSparkEmitter(parent, scale)
+        local e = Instance.new("ParticleEmitter")
+        e.Name = "Sparks"
+        e.Enabled = false
+        e.Rate = 0
+        e.Lifetime = NumberRange.new(0.25, 0.55)
+        e.Speed = NumberRange.new(8, 18)
+        e.SpreadAngle = Vector2.new(180, 180)
+        e.Drag = 3
+        e.Acceleration = Vector3.new(0, -18, 0)
+        e.LightEmission = 1
+        e.Color = ColorSequence.new(THEME.on, C.OrangeOn)
+        e.Size = NumberSequence.new({
+                NumberSequenceKeypoint.new(0, 0.28 * scale),
+                NumberSequenceKeypoint.new(1, 0),
+        })
+        e.Transparency = NumberSequence.new({
+                NumberSequenceKeypoint.new(0, 0),
+                NumberSequenceKeypoint.new(0.7, 0.2),
+                NumberSequenceKeypoint.new(1, 1),
+        })
+        e.Parent = parent
+        return e
+end
+
+local function burst(emitter, count)
+        if SETTINGS.sparks and emitter and emitter.Parent then
+                emitter:Emit(count)
+        end
+end
+
+--------------------------------------------------------------------
+-- ОБЩИЕ ЭФФЕКТЫ (тряска камеры, FOV, ударные волны, резак)
+--------------------------------------------------------------------
+local shakePower = 0
+
+local function shake(power)
+        shakePower = math.max(shakePower, power)
+end
+
+-- вызывается каждый кадр в главном цикле: двигает камеру и затухает
+local function applyShake(dt)
+        if shakePower <= 0.001 then
+                return
+        end
+        local cam = workspace.CurrentCamera
+        if cam then
+                local m = shakePower * 0.045
+                cam.CFrame = cam.CFrame
+                        * CFrame.Angles((math.random() - 0.5) * m, (math.random() - 0.5) * m, (math.random() - 0.5) * m * 0.6)
+        end
+        shakePower = math.max(0, shakePower - dt * (1.6 + shakePower * 3.4))
+end
+
+local function fovPunch(delta, upTime, backTime)
+        local cam = workspace.CurrentCamera
+        if not cam then
+                return
+        end
+        local base = cam.FieldOfView
+        local t = TweenService:Create(cam, TweenInfo.new(upTime or 0.05, Quad, EOut), { FieldOfView = base + delta })
+        t:Play()
+        t.Completed:Once(function(state)
+                if state == Enum.PlaybackState.Completed and cam.Parent then
+                        TweenService:Create(cam, TweenInfo.new(backTime or 0.28, Quad, EOut), { FieldOfView = base }):Play()
+                end
+        end)
+end
+
+-- твин эффектов: НЕ зависит от ползунка скорости трансформации
+local function fxtween(inst, time, props, style, dir)
+        local t = TweenService:Create(inst, TweenInfo.new(time, style or Quad, dir or EOut), props)
+        t:Play()
+        return t
+end
+
+-- папка для временных эффектов (обломки, метки, волны)
+local fxHolder
+local function ensureFx()
+        if fxHolder and fxHolder.Parent then
+                return fxHolder
+        end
+        fxHolder = Instance.new("Folder")
+        fxHolder.Name = "RickRoboArmFX"
+        fxHolder.Parent = workspace
+        return fxHolder
+end
+
+--------------------------------------------------------------------
+-- ЗВУКИ (v7): пользовательские ID в таблице SFX
+--------------------------------------------------------------------
+local SFX = {
+        Servo = 9118377325, -- движение суставов/стволов
+        Latch = 9125921369, -- защёлкивание ламп и панелей
+        Piston = 9116673678, -- удар штока/корпуса/разлом стены
+        Hiss = 9116496050, -- гидравлика/пневматика
+        PowerUp = 9046345603, -- включение энергии
+        PowerDown = 9119816522, -- выключение
+        LockClick = 9120104199, -- замок/смена режима
+        Plasma = 3029174392, -- выстрел плазмы (и бас для меги)
+}
+
+-- короткий звук: сам удаляется после проигрывания; looped=true — вернёт Sound
+local function playSfx(id, volume, pitch, looped)
+        if not id or SETTINGS.sfx <= 0.001 then
+                return nil
+        end
+        local s = Instance.new("Sound")
+        s.SoundId = "rbxassetid://" .. id
+        s.Volume = (volume or 1) * SETTINGS.sfx
+        s.PlaybackSpeed = pitch or 1
+        s.Looped = looped or false
+        s.Parent = ensureFx()
+        s:Play()
+        if looped then
+                return s
+        end
+        Debris:AddItem(s, 8)
+        s.Ended:Connect(function()
+                s:Destroy()
+        end)
+        return s
+end
+
+local function stopSfx(s)
+        if s then
+                s:Stop()
+                s:Destroy()
+        end
+end
+
+local function isCharacterPart(inst)
+        local node = inst
+        while node and node ~= workspace do
+                if node:IsA("Model") and node:FindFirstChildOfClass("Humanoid") then
+                        return true
+                end
+                node = node.Parent
+        end
+        return false
+end
+
+-- растворённые детали: [часть] = исходные свойства
+local activeDissolves = {}
+
+local AXIS_VEC = { Vector3.xAxis, Vector3.yAxis, Vector3.zAxis }
+
+local function axisVal(v, axis)
+        if axis == 1 then
+                return v.X
+        elseif axis == 2 then
+                return v.Y
+        else
+                return v.Z
+        end
+end
+
+local function withAxisSize(size, axis, value)
+        if axis == 1 then
+                return Vector3.new(value, size.Y, size.Z)
+        elseif axis == 2 then
+                return Vector3.new(size.X, value, size.Z)
+        else
+                return Vector3.new(size.X, size.Y, value)
+        end
+end
+
+-- расширяющееся неоновое кольцо-ударная волна
+local function spawnShockwave(pos, normal, diameter, color)
+        local n = normal
+        if n.Magnitude < 1e-3 then
+                n = Vector3.new(0, 1, 0)
+        end
+        local ring = Instance.new("Part")
+        ring.Name = "RickShockwave"
+        ring.Shape = Enum.PartType.Cylinder
+        ring.Size = Vector3.new(0.06, diameter * 0.3, diameter * 0.3)
+        ring.CFrame = CFrame.lookAt(pos, pos + n.Unit) * CFrame.Angles(0, math.pi / 2, 0)
+        ring.Anchored = true
+        ring.CanCollide = false
+        ring.CanQuery = false
+        ring.CanTouch = false
+        ring.Material = Enum.Material.Neon
+        ring.Color = color
+        ring.Transparency = 0.15
+        ring.Parent = ensureFx()
+        fxtween(ring, 0.38, { Size = Vector3.new(0.06, diameter, diameter), Transparency = 1 }, Quad, EOut)
+        Debris:AddItem(ring, 0.55)
+end
+
+-- светящаяся метка на линии реза
+local function spawnCutDot(pos, color, scale)
+        local d = Instance.new("Part")
+        d.Name = "RickCutDot"
+        d.Shape = Enum.PartType.Ball
+        d.Size = Vector3.one * math.max(0.07 * scale, 0.05)
+        d.CFrame = CFrame.new(pos)
+        d.Anchored = true
+        d.CanCollide = false
+        d.CanQuery = false
+        d.CanTouch = false
+        d.Material = Enum.Material.Neon
+        d.Color = color
+        d.Parent = ensureFx()
+        Debris:AddItem(d, 5)
+end
+
+-- искры и пыль в точке (разлом, попадания)
+local function spawnPieceBurst(pos, scale)
+        local p = Instance.new("Part")
+        p.Name = "RickBurst"
+        p.Size = Vector3.new(0.2, 0.2, 0.2)
+        p.Transparency = 1
+        p.Anchored = true
+        p.CanCollide = false
+        p.CanQuery = false
+        p.CanTouch = false
+        p.Position = pos
+        p.Parent = ensureFx()
+
+        local sparks = makeSparkEmitter(p, scale)
+        sparks.Color = ColorSequence.new(Color3.new(1, 1, 1), C.OrangeOn)
+        sparks:Emit(30)
+
+        local dust = Instance.new("ParticleEmitter")
+        dust.Color = ColorSequence.new(Color3.fromRGB(135, 124, 110), Color3.fromRGB(92, 88, 82))
+        dust.LightEmission = 0
+        dust.Lifetime = NumberRange.new(0.6, 1.5)
+        dust.Rate = 0
+        dust.Speed = NumberRange.new(2, 7)
+        dust.SpreadAngle = Vector2.new(180, 180)
+        dust.Acceleration = Vector3.new(0, -7, 0)
+        dust.Size = NumberSequence.new({
+                NumberSequenceKeypoint.new(0, 0.45 * scale),
+                NumberSequenceKeypoint.new(1, 0.95 * scale),
+        })
+        dust.Transparency = NumberSequence.new({
+                NumberSequenceKeypoint.new(0, 0.45),
+                NumberSequenceKeypoint.new(1, 1),
+        })
+        dust.Parent = p
+        dust:Emit(16)
+        Debris:AddItem(p, 2.4)
+end
+
+--------------------------------------------------------------------
+-- ОПРЕДЕЛЕНИЕ РИГА (R6 / R15)
+-- mount   — настоящая часть руки, к которой крепится киберпредплечье
+-- rootPos — «запястье» (конец руки) в системе координат mount
+-- sleeveLen — длина киберпредплечья в studs
+-- real    — настоящие части, которые прячем при превращении
+--------------------------------------------------------------------
+local function detectRig(char)
+        local humanoid = char:WaitForChild("Humanoid", 10)
+        local hrp = char:WaitForChild("HumanoidRootPart", 10)
+        if not humanoid or not hrp then
+                return nil
+        end
+
+        if humanoid.RigType == Enum.HumanoidRigType.R15 then
+                local torso = char:WaitForChild("UpperTorso", 10)
+                local lowerTorso = char:WaitForChild("LowerTorso", 10) -- (v14) для Waist
+                local upper = char:WaitForChild("RightUpperArm", 10)
+                local lower = char:WaitForChild("RightLowerArm", 10)
+                local hand = char:WaitForChild("RightHand", 10)
+                if not (torso and upper and lower and hand) then
+                        return nil
+                end
+                local shoulder = upper:WaitForChild("RightShoulder", 10)
+                if not shoulder then
+                        return nil
+                end
+                local elbow = lower:FindFirstChild("RightElbow")
+                local wrist = hand:FindFirstChild("RightWrist")
+
+                local rootPos, elbowY
+                if elbow and wrist then
+                        local handCF = elbow.C0 * elbow.C1:Inverse() * wrist.C0 * wrist.C1:Inverse()
+                        rootPos = Vector3.new(handCF.X, handCF.Y - hand.Size.Y / 2 - 0.05, handCF.Z)
+                        elbowY = elbow.C0.Y
+                else
+                        elbowY = -upper.Size.Y / 2 + 0.15
+                        rootPos = Vector3.new(0, elbowY - lower.Size.Y - hand.Size.Y, 0)
+                end
+
+                return {
+                        name = "R15",
+                        humanoid = humanoid,
+                        hrp = hrp,
+                        torso = torso,
+                        mount = upper,
+                        shoulder = shoulder,
+                        waist = lowerTorso and lowerTorso:FindFirstChild("Waist"),
+                        real = { lower, hand },
+                        rootPos = rootPos,
+                        sleeveLen = math.clamp(elbowY - rootPos.Y, 1.0, 3.0),
+                        width = upper.Size.X,
+                        boxy = false,
+                }
+        end
+
+        local torso = char:WaitForChild("Torso", 10)
+        local rightArm = char:WaitForChild("Right Arm", 10)
+        if not (torso and rightArm) then
+                return nil
+        end
+        local shoulder = torso:WaitForChild("Right Shoulder", 10)
+        if not shoulder then
+                return nil
+        end
+
+        return {
+                name = "R6",
+                humanoid = humanoid,
+                hrp = hrp,
+                torso = torso,
+                mount = rightArm,
+                shoulder = shoulder,
+                real = {}, -- рука цельная: манжета закрывает кисть
+                rootPos = Vector3.new(0, -rightArm.Size.Y / 2 - 0.05, 0),
+                sleeveLen = rightArm.Size.Y / 2,
+                width = rightArm.Size.X,
+                boxy = true,
+        }
+end
+
+--------------------------------------------------------------------
+-- СБОРКА МОДЕЛИ RickRoboArm
+-- Система координат оружия: вперёд = -Z, вверх = +Y, вправо = +X.
+-- Root стоит на конце руки (запястье); рукав уходит назад (+Z), пушка вперёд (-Z).
+-- «u» — единица дизайна: 1u = S studs (подгоняется под толщину руки).
+--------------------------------------------------------------------
+local function buildArm(char, rig)
+        for _, old in ipairs(char:GetChildren()) do
+                if old.Name == CONFIG.ModelName then
+                        old:Destroy() -- защита от дублей
+                end
+        end
+        if not char.Parent then
+                return nil
+        end
+
+        local S = CONFIG.SizeFactor * math.clamp(rig.width, 0.7, 1.6)
+        local Lu = (rig.sleeveLen + 0.05) / S -- длина рукава в u
+        local D = (rig.width * 1.1) / S -- толщина рукава в u (чуть толще настоящей руки)
+        local R = D / 2
+
+        local a = {
+                rigName = rig.name,
+                scale = S,
+                char = char,
+                humanoid = rig.humanoid,
+                hrp = rig.hrp,
+                torso = rig.torso,
+                mount = rig.mount,
+                shoulder = rig.shoulder,
+                waist = rig.waist, -- (v14) R15: сустав поясницы, фиксируем при прицеливании
+                shoulderBase = rig.shoulder.C0,
+                c1rot = rig.shoulder.C1.Rotation,
+                pivot = rig.shoulder.C0.Position, -- плечо в системе торса
+                real = rig.real,
+                origTrans = {},
+                joints = {},
+                lamps = {},
+                glows = {},
+                themed = {},
+                tips = {},
+                tipParts = {},
+                muzzles = {},
+                emitters = {},
+                visible = {},
+                beams = {},
+                conns = {},
+                isOpen = false,
+                ready = false,
+                shown = false,
+                morph = "out", -- "out": видна настоящая рука, "in": видно оружие
+                firing = false,
+                megaBusy = false,
+                shot = 0,
+                lightRest = 0,
+        }
+        for _, p in ipairs(a.real) do
+                a.origTrans[p] = p.Transparency
+        end
+
+        local model = Instance.new("Model")
+        model.Name = CONFIG.ModelName
+
+        local cylParts = {}
+        local CYL = CFrame.Angles(0, math.pi / 2, 0) -- кладёт ось цилиндра вдоль Z
+
+        local function CF(x, y, z)
+                return CFrame.new(x * S, y * S, z * S)
+        end
+
+        ---------------------------------------------------------------- детали
+        local function newPart(name, shape, size, color, material)
+                local p = Instance.new("Part")
+                p.Name = name
+                p.Shape = shape
+                p.Size = size
+                p.Color = color
+                p.Material = material
+                p.CanCollide = false
+                p.CanTouch = false
+                p.CanQuery = false
+                p.Massless = true
+                p.Anchored = false
+                p.TopSurface = Enum.SurfaceType.Smooth
+                p.BottomSurface = Enum.SurfaceType.Smooth
+                p.Parent = model
+                return p
+        end
+
+        local function block(name, x, y, z, color, material)
+                return newPart(name, Enum.PartType.Block, Vector3.new(x, y, z) * S, color, material)
+        end
+
+        local function cyl(name, length, diameter, color, material)
+                local p = newPart(name, Enum.PartType.Cylinder, Vector3.new(length, diameter, diameter) * S, color, material)
+                cylParts[p] = true
+                return p
+        end
+
+        local function ball(name, d, color, material)
+                return newPart(name, Enum.PartType.Ball, Vector3.new(d, d, d) * S, color, material)
+        end
+
+        -- трубка вдоль Z: цилиндр на R15, коробка на R6 (рука там квадратная)
+        local function tube(name, length, diameter, color, material)
+                if rig.boxy then
+                        return block(name, diameter, diameter, length, color, material)
+                end
+                return cyl(name, length, diameter, color, material)
+        end
+
+        local function dummy(name) -- невидимая опорная деталь
+                local p = block(name, 0.1, 0.1, 0.1, C.DarkSteel, Enum.Material.SmoothPlastic)
+                p.Transparency = 1
+                return p
+        end
+
+        ---------------------------------------------------------------- крепления
+        local function fix(parent, child, cf) -- неподвижно (Weld)
+                local w = Instance.new("Weld")
+                w.Name = "W_" .. child.Name
+                w.Part0, w.Part1 = parent, child
+                w.C0 = cf or CFrame.new()
+                if cylParts[child] then
+                        w.C1 = CYL:Inverse()
+                end
+                w.Parent = child
+        end
+
+        local function motor(name, parent, child, closed, open) -- подвижно (Motor6D, двигаем C0)
+                local m = Instance.new("Motor6D")
+                m.Name = "J_" .. name
+                m.Part0, m.Part1 = parent, child
+                m.C0 = closed
+                if cylParts[child] then
+                        m.C1 = CYL:Inverse()
+                end
+                m.Parent = child
+                a.joints[name] = { motor = m, closed = closed, open = open }
+        end
+
+        ---------------------------------------------------------------- свет и эффекты
+        local function glow(p, kind, list)
+                local e = { part = p, kind = kind, lit = false }
+                if kind == "cyan" then
+                        e.on, e.off = THEME.on, THEME.off
+                        table.insert(a.themed, e)
+                else
+                        e.on, e.off = C.OrangeOn, C.OrangeOff
+                end
+                p.Color = e.off
+                if list then
+                        table.insert(list, e)
+                end
+                return e
+        end
+
+        local function attach(part, cf)
+                local at = Instance.new("Attachment")
+                at.CFrame = cf
+                at.Parent = part
+                return at
+        end
+
+        local function beam(a0, a1, width, color, curve, emission)
+                local b = Instance.new("Beam")
+                b.Attachment0, b.Attachment1 = a0, a1
+                b.Color = ColorSequence.new(color)
+                b.Width0, b.Width1 = width * S, width * S
+                b.FaceCamera = true
+                b.Segments = curve and 16 or 2
+                b.CurveSize0 = (curve or 0) * S
+                b.CurveSize1 = (curve or 0) * S
+                b.LightEmission = emission or 0
+                b.Parent = a0.Parent
+                return b
+        end
+
+        local function sparks(parent)
+                local e = makeSparkEmitter(parent, S)
+                table.insert(a.emitters, e)
+                return e
+        end
+
+        --================================================================
+        -- ROOT — на конце настоящей руки (запястье), «вперёд» = от локтя к пальцам
+        --================================================================
+        local root = dummy("Root")
+        fix(rig.mount, root, CFrame.new(rig.rootPos) * CFrame.Angles(-math.pi / 2, 0, 0))
+
+        --================================================================
+        -- КИБЕРПРЕДПЛЕЧЬЕ (рукав) — неподвижная часть
+        --================================================================
+        local sleeve = tube("Sleeve", Lu, D, C.Steel, Enum.Material.Metal)
+        fix(root, sleeve, CF(0, 0, Lu / 2))
+
+        local midZ = math.max(1.12, Lu * 0.75)
+        for i, d in ipairs({ { 0.07, 0.14 }, { midZ, 0.16 }, { Lu - 0.07, 0.14 } }) do
+                local ring = tube("Ring" .. i, d[2], D + 0.14, C.DarkSteel, Enum.Material.Metal)
+                fix(root, ring, CF(0, 0, d[1]))
+        end
+
+        local band = tube("GlowBand", 0.08, D + 0.06, C.DarkSteel, Enum.Material.Neon)
+        fix(root, band, CF(0, 0, 0.2))
+        a.band = glow(band, "cyan")
+
+        for i = 1, 4 do
+                local lamp = block("Lamp" .. i, 0.16, 0.1, 0.12, C.OrangeOff, Enum.Material.Neon)
+                fix(root, lamp, CF(0, R - 0.01, 0.38 + (i - 1) * 0.18))
+                glow(lamp, "orange", a.lamps)
+        end
+
+        for _, sx in ipairs({ 1, -1 }) do
+                local bolt = ball("Bolt", 0.18, C.DarkSteel, Enum.Material.Metal)
+                fix(root, bolt, CF((R - 0.06) * sx, 0, -0.02))
+
+                local armor = block("SideArmor", 0.1, 0.5, 0.5, C.Plate, Enum.Material.Metal)
+                fix(root, armor, CF((R + 0.04) * sx, 0, 0.7))
+        end
+
+        --================================================================
+        -- 4 ПАНЕЛИ «НОСА» — раздвигаются и поворачиваются на шарнирах
+        --================================================================
+        local HW, PL, PT = R - 0.06, 0.7, 0.12
+        local ANG, OUT = 0.62, 0.26
+
+        local plateDefs = {
+                { "PlateTop", Vector3.new(HW * 2 + PT, PT, PL), Vector3.new(0, HW, 0), Vector3.new(0, OUT, 0), CFrame.Angles(ANG, 0, 0) },
+                { "PlateBottom", Vector3.new(HW * 2 + PT, PT, PL), Vector3.new(0, -HW, 0), Vector3.new(0, -OUT, 0), CFrame.Angles(-ANG, 0, 0) },
+                { "PlateRight", Vector3.new(PT, HW * 2 - PT, PL), Vector3.new(HW, 0, 0), Vector3.new(OUT, 0, 0), CFrame.Angles(0, -ANG, 0) },
+                { "PlateLeft", Vector3.new(PT, HW * 2 - PT, PL), Vector3.new(-HW, 0, 0), Vector3.new(-OUT, 0, 0), CFrame.Angles(0, ANG, 0) },
+        }
+
+        for _, d in ipairs(plateDefs) do
+                local name, size, hinge, out, rot = d[1], d[2], d[3], d[4], d[5]
+                local p = block(name, size.X, size.Y, size.Z, C.Plate, Enum.Material.Metal)
+                local closed = CF(hinge.X, hinge.Y, hinge.Z) * CF(0, 0, -PL / 2)
+                local open = CF(hinge.X + out.X, hinge.Y + out.Y, hinge.Z + out.Z) * rot * CF(0, 0, -PL / 2)
+                motor(name, root, p, closed, open)
+        end
+
+        --================================================================
+        -- ШТОК и КРЫШКА
+        --================================================================
+        local pistonPivot = dummy("PistonPivot")
+        motor("Piston", root, pistonPivot, CF(0, 0, 0.3), CF(0, 0, -0.7))
+
+        local rod = cyl("PistonRod", 1.4, 0.3, C.LightSteel, Enum.Material.Metal)
+        fix(pistonPivot, rod, CFrame.new())
+
+        local capW = 2 * R - 0.1
+        local ch = capW / 2
+        local capZ = -(PL + 0.08 + 0.3)
+        local cap = block("Cap", capW, capW, 0.12, C.Steel, Enum.Material.Metal)
+        motor(
+                "Cap",
+                pistonPivot,
+                cap,
+                CF(0, -ch, capZ) * CF(0, ch, 0),
+                CF(0, -ch, capZ) * CFrame.Angles(-math.pi / 2, 0, 0) * CF(0, ch, 0)
+        )
+
+        local visor = block("CapVisor", capW * 0.6, 0.22, 0.04, C.DarkSteel, Enum.Material.Metal)
+        fix(cap, visor, CF(0, 0.15, -0.08))
+
+        local capEye = block("CapEye", 0.28, 0.28, 0.04, C.DarkSteel, Enum.Material.Neon)
+        fix(cap, capEye, CF(0, -0.12, 0.08))
+        glow(capEye, "cyan", a.glows)
+
+        local capLamp = block("CapLamp", capW * 0.55, 0.1, 0.04, C.OrangeOff, Enum.Material.Neon)
+        fix(cap, capLamp, CF(0, 0.28, 0.08))
+        glow(capLamp, "orange", a.glows)
+
+        --================================================================
+        -- КОРПУС ПУШКИ — скользит по штоку
+        --================================================================
+        local BW = 0.85
+        local body = block("GunBody", BW, BW, 0.5, C.DarkSteel, Enum.Material.Metal)
+        motor("Body", root, body, CF(0, 0, 0.55), CF(0, 0, -1.55))
+
+        local core = ball("Core", 0.34, C.DarkSteel, Enum.Material.Neon)
+        fix(body, core, CF(0, BW / 2, 0.05))
+        glow(core, "cyan", a.glows)
+        a.core = core
+
+        for _, sx in ipairs({ 1, -1 }) do
+                local lamp = block("BodyLamp", 0.08, 0.14, 0.22, C.OrangeOff, Enum.Material.Neon)
+                fix(body, lamp, CF((BW / 2 + 0.02) * sx, 0, 0.08))
+                glow(lamp, "orange", a.glows)
+        end
+
+        --================================================================
+        -- ДВА ТЕЛЕСКОПИЧЕСКИХ СТВОЛА (золото + белые манжеты)
+        --================================================================
+        local barrelDefs = {
+                -- id, x, y, длина основной трубы, длина выдвижной
+                { "A", 0.34, 0.1, 1.0, 0.9 },
+                { "B", -0.34, -0.1, 0.75, 0.7 },
+        }
+
+        for _, d in ipairs(barrelDefs) do
+                local id, bx, by, len, flen = d[1], d[2], d[3], d[4], d[5]
+
+                local bp = dummy("BarrelPivot" .. id)
+                fix(body, bp, CF(bx, by, -0.25))
+
+                local rear = cyl("RearTube" .. id, len, 0.3, C.Gold, Enum.Material.Metal)
+                fix(bp, rear, CF(0, 0, -len / 2))
+
+                local cuff = cyl("Cuff" .. id, 0.26, 0.4, C.White, Enum.Material.SmoothPlastic)
+                fix(bp, cuff, CF(0, 0, -0.2))
+
+                local ring = cyl("GlowRing" .. id, 0.05, 0.35, C.DarkSteel, Enum.Material.Neon)
+                fix(bp, ring, CF(0, 0, -0.5))
+                glow(ring, "cyan", a.glows)
+
+                local fp = dummy("FrontPivot" .. id)
+                motor("Front" .. id, bp, fp, CF(0, 0, -0.05), CF(0, 0, -(len - 0.12)))
+
+                local ft = cyl("FrontTube" .. id, flen, 0.22, C.GoldDark, Enum.Material.Metal)
+                fix(fp, ft, CF(0, 0, -flen / 2))
+
+                local tip = cyl("Tip" .. id, 0.07, 0.27, C.DarkSteel, Enum.Material.Neon)
+                fix(fp, tip, CF(0, 0, -flen))
+                glow(tip, "cyan", a.glows)
+
+                table.insert(a.tipParts, tip)
+                table.insert(a.muzzles, attach(tip, CFrame.new()))
+                table.insert(a.tips, sparks(tip))
+        end
+
+        --================================================================
+        -- КАБЕЛИ, ТЯГИ, ЭНЕРГОКАБЕЛЬ, ЛАЗЕР
+        --================================================================
+        local up = CFrame.Angles(0, 0, math.pi / 2)
+        local down = CFrame.Angles(0, 0, -math.pi / 2)
+
+        table.insert(a.beams, beam(attach(root, CF(0.26, R - 0.08, 0.35) * up), attach(body, CF(0.26, BW / 2 - 0.02, 0.15) * up), 0.07, C.Cable, 0.3))
+        table.insert(a.beams, beam(attach(root, CF(-0.26, -(R - 0.08), 0.35) * down), attach(body, CF(-0.26, -(BW / 2 - 0.02), 0.15) * down), 0.07, C.Cable, 0.3))
+
+        for _, sx in ipairs({ 1, -1 }) do
+                table.insert(a.beams, beam(attach(root, CF((R - 0.06) * sx, 0, -0.02)), attach(body, CF((BW / 2 + 0.02) * sx, 0, 0.1)), 0.11, C.LightSteel, nil))
+        end
+
+        a.energy = beam(attach(root, CF(-0.26, R - 0.08, 0.6) * up), attach(body, CF(-0.26, BW / 2 - 0.02, 0.3) * up), 0.1, THEME.on, 0.25, 1)
+        a.energy.Width0, a.energy.Width1 = 0.001, 0.001
+
+        a.aimAtt = Instance.new("Attachment")
+        a.aimAtt.Name = "RickArmAimPoint"
+        a.aimAtt.Parent = workspace.Terrain
+        a.laser = beam(a.muzzles[1], a.aimAtt, 0.05, THEME.on, nil, 1)
+        a.laser.Transparency = NumberSequence.new(0.35)
+        a.laser.Enabled = false
+
+        --================================================================
+        -- ИСКРЫ, СВЕТ, ПОЗА
+        --================================================================
+        a.sparksNose = sparks(root)
+        a.sparksArm = sparks(sleeve)
+        a.sparksBody = sparks(body)
+
+        local light = Instance.new("PointLight")
+        light.Name = "ArmLight"
+        light.Color = THEME.on
+        light.Range = 12 * S
+        light.Brightness = 0
+        light.Shadows = false
+        light.Parent = body
+        a.light = light
+
+        local pose = Instance.new("NumberValue") -- 0 = рука опущена, 1 = целится
+        pose.Name = "Pose"
+        pose.Parent = model
+        a.pose = pose
+
+        local rp = RaycastParams.new()
+        rp.FilterType = Enum.RaycastFilterType.Exclude
+        rp.FilterDescendantsInstances = { char }
+        a.rayParams = rp
+
+        local fxrp = RaycastParams.new()
+        fxrp.FilterType = Enum.RaycastFilterType.Exclude
+        fxrp.FilterDescendantsInstances = { char, model }
+        a.fxRay = fxrp
+
+        -- до превращения оружие невидимо
+        for _, d in ipairs(model:GetDescendants()) do
+                if d:IsA("BasePart") and d.Transparency == 0 then
+                        table.insert(a.visible, d)
+                        d.Transparency = 1
+                end
+        end
+        for _, b in ipairs(a.beams) do
+                b.Enabled = false
+        end
+
+        if not char.Parent then
+                model:Destroy()
+                a.aimAtt:Destroy()
+                return nil
+        end
+
+        a.model = model
+        model.Parent = char
+
+        -- если модель удалили снаружи — сбросить состояние (при следующем нажатии соберётся заново)
+        table.insert(
+                a.conns,
+                model.Destroying:Connect(function()
+                        if arm == a then
+                                destroyArm()
+                        end
+                end)
+        )
+
+        return a
+end
+
+--------------------------------------------------------------------
+-- ОЧИСТКА
+--------------------------------------------------------------------
+local function setRealHidden(a, hidden)
+        for _, p in ipairs(a.real) do
+                if p.Parent then
+                        p.Transparency = hidden and 1 or a.origTrans[p]
+                end
+        end
+end
+
+local function unbindFire()
+        fireHeld = false
+        ContextActionService:UnbindAction(CONFIG.FireAction)
+end
+
+destroyArm = function()
+        transitionId += 1
+        cancelTweens()
+        if cutReset then
+                cutReset()
+        end
+        unbindFire()
+
+        local a = arm
+        arm = nil
+        if not a then
+                return
+        end
+
+        for _, c in ipairs(a.conns) do
+                c:Disconnect()
+        end
+        setRealHidden(a, false) -- настоящая рука возвращается
+        if a.shoulder.Parent then
+                a.shoulder.C0 = a.shoulderBase
+        end
+        if a.savedAutoRotate ~= nil and a.humanoid.Parent then
+                a.humanoid.AutoRotate = a.savedAutoRotate
+        end
+        if a.aimAtt then
+                a.aimAtt:Destroy()
+        end
+        if a.model then
+                a.model:Destroy()
+        end
+        ui.setStatus("closed", false)
+        ui.setRig("—")
+        ui.progress(0)
+end
+
+--------------------------------------------------------------------
+-- ХЕЛПЕРЫ АНИМАЦИИ
+--------------------------------------------------------------------
+local function moveJoint(a, name, toOpen, time, style, dir)
+        local j = a.joints[name]
+        return tween(j.motor, time, { C0 = toOpen and j.open or j.closed }, style, dir)
+end
+
+local function settled(a, name, toOpen)
+        local j = a.joints[name]
+        local target = toOpen and j.open or j.closed
+        return (j.motor.C0.Position - target.Position).Magnitude < 0.03 * a.scale
+end
+
+-- двигает сустав, но пропускает, если он уже на месте (удобно при повторном нажатии)
+local function go(a, name, toOpen, time, style, dir)
+        if settled(a, name, toOpen) then
+                return nil
+        end
+        return moveJoint(a, name, toOpen, time, style, dir)
+end
+
+local function setGlow(e, on, time)
+        e.lit = on
+        return tween(e.part, time or 0.15, { Color = on and e.on or e.off })
+end
+
+local function flashOn(e) -- короткая белая вспышка, потом цвет свечения
+        e.lit = true
+        local t = tween(e.part, 0.1, { Color = Color3.new(1, 1, 1) })
+        t.Completed:Once(function(state)
+                if state == Enum.PlaybackState.Completed and e.part.Parent then
+                        tween(e.part, 0.35, { Color = e.on })
+                end
+        end)
+end
+
+local function setEnergy(a, on, time)
+        local w = on and 0.09 * a.scale or 0.001
+        tween(a.energy, time or 0.3, { Width0 = w, Width1 = w })
+end
+
+local function pulse(a, peak, rest) -- световой импульс: резко вверх, потом плавно к «покою»
+        a.lightRest = rest
+        local upTween = tween(a.light, 0.07, { Brightness = peak })
+        upTween.Completed:Once(function(state)
+                if state == Enum.PlaybackState.Completed and a.light.Parent then
+                        tween(a.light, 0.4, { Brightness = a.lightRest })
+                end
+        end)
+end
+
+local function setBeams(a, on)
+        for _, b in ipairs(a.beams) do
+                b.Enabled = on
+        end
+end
+
+local function fadeModel(a, show, time)
+        a.shown = show
+        for _, p in ipairs(a.visible) do
+                tween(p, time, { Transparency = show and 0 or 1 }, Quad, EOut)
+        end
+        if show then
+                task.delay(time * 0.6 / SETTINGS.speed, function()
+                        if a.model.Parent and a.shown then
+                                setBeams(a, true)
+                        end
+                end)
+        else
+                setBeams(a, false)
+                a.laser.Enabled = false
+        end
+end
+
+--------------------------------------------------------------------
+-- ПРЕВРАЩЕНИЕ: настоящее предплечье -> киберпредплечье (и обратно)
+--------------------------------------------------------------------
+local function morphIn(a, alive)
+        pulse(a, 4, 0)
+        burst(a.sparksArm, 26)
+        burst(a.sparksNose, 16)
+        for i = 1, 3 do -- «глитч» настоящего предплечья и кисти
+                setRealHidden(a, true)
+                pause(0.045)
+                if not alive() then
+                        return false
+                end
+                setRealHidden(a, false)
+                pause(0.045)
+                if not alive() then
+                        return false
+                end
+                if i == 1 then
+                        fadeModel(a, true, 0.3)
+                end
+                shake(0.12)
+        end
+        -- стробоскоп: сборку «прошивает» током перед раскрытием
+        for _, lamp in ipairs(a.lamps) do
+                setGlow(lamp, true, 0.05)
+        end
+        pause(0.07)
+        if not alive() then
+                return false
+        end
+        for _, lamp in ipairs(a.lamps) do
+                setGlow(lamp, false, 0.05)
+        end
+        setRealHidden(a, true)
+        a.morph = "in"
+        return true
+end
+
+local function morphOut(a, alive)
+        burst(a.sparksArm, 22)
+        pulse(a, 3, 0)
+        fadeModel(a, false, 0.3)
+        for _ = 1, 3 do
+                setRealHidden(a, false)
+                pause(0.045)
+                if not alive() then
+                        return false
+                end
+                setRealHidden(a, true)
+                pause(0.045)
+                if not alive() then
+                        return false
+                end
+                shake(0.1)
+        end
+        shake(0.15)
+        setRealHidden(a, false)
+        a.morph = "out"
+        return true
+end
+
+--------------------------------------------------------------------
+-- РАСКРЫТИЕ
+--------------------------------------------------------------------
+local bindFireImpl -- определяется ниже (нужна fire)
+
+local function runOpen(a, id)
+        local function alive()
+                return id == transitionId and a.model.Parent ~= nil
+        end
+
+        -- 0. предплечье превращается в оружие (глитч с дрожью)
+        if a.morph ~= "in" then
+                if not morphIn(a, alive) then
+                        return
+                end
+        else
+                setRealHidden(a, true)
+                fadeModel(a, true, 0.2)
+        end
+        ui.progress(0.12)
+        pause(0.08)
+        if not alive() then
+                return
+        end
+
+        -- 1. рука вскидывается, лампы защёлкиваются по очереди с микро-искрами
+        local poseT = tween(a.pose, 0.5, { Value = 1 }, Quad, EInOut)
+        for _, lamp in ipairs(a.lamps) do
+                if not alive() then
+                        return
+                end
+                flashOn(lamp)
+                playSfx(SFX.Latch, 0.45, 0.9 + math.random() * 0.25)
+                burst(a.sparksNose, 3)
+                shake(0.06)
+                pause(0.07)
+        end
+        if not alive() then
+                return
+        end
+        setGlow(a.band, true, 0.2)
+        waitFor(poseT)
+        if not alive() then
+                return
+        end
+        shake(0.16)
+        ui.progress(0.28)
+
+        -- 2. панели «носа» — по очереди, с механическим защёлкиванием
+        burst(a.sparksNose, 16)
+        pulse(a, 3, 0.6)
+        for i, name in ipairs(PLATE_NAMES) do
+                task.delay((i - 1) * 0.07 / SETTINGS.speed, function()
+                        if alive() then
+                                go(a, name, true, 0.4, Back, EOut)
+                                playSfx(SFX.Latch, 0.55, 0.85 + math.random() * 0.2)
+                                shake(0.08)
+                        end
+                end)
+        end
+        pause(0.07 * #PLATE_NAMES + 0.42)
+        if not alive() then
+                return
+        end
+        burst(a.sparksNose, 8)
+        ui.progress(0.48)
+
+        -- 3. шток: рывок до половины, пауза-перезарядка, затем УДАР до упора
+        local pj = a.joints.Piston
+        local half = tween(pj.motor, 0.2, { C0 = pj.closed:Lerp(pj.open, 0.55) }, Quad, EOut)
+        playSfx(SFX.Hiss, 0.35, 1.1)
+        waitFor(half)
+        if not alive() then
+                return
+        end
+        pause(0.08)
+        if not alive() then
+                return
+        end
+        local slam = tween(pj.motor, 0.14, { C0 = pj.open }, Quart, EOut)
+        slam.Completed:Once(function(state)
+                if state == Enum.PlaybackState.Completed and a.model.Parent then
+                        playSfx(SFX.Piston, 0.95, 0.9)
+                        shake(0.5)
+                        burst(a.sparksNose, 12)
+                        pulse(a, 3, 0.8)
+                end
+        end)
+        pause(0.1)
+        if not alive() then
+                return
+        end
+
+        -- 4. крышка откидывается, энергия подаётся
+        playSfx(SFX.Hiss, 0.4, 1)
+        waitFor(go(a, "Cap", true, 0.4, Back, EOut))
+        if not alive() then
+                return
+        end
+        pulse(a, 3.5, 1)
+        setEnergy(a, true, 0.35)
+        ui.progress(0.66)
+
+        -- 5. корпус летит по штоку и врезается в упор
+        local b = go(a, "Body", true, 0.42, Quart, EOut)
+        waitFor(b)
+        if not alive() then
+                return
+        end
+        playSfx(SFX.Piston, 0.85, 0.75)
+        shake(0.32)
+        burst(a.sparksBody, 18)
+        ui.progress(0.82)
+
+        -- 6. стволы телескопом: сначала верхний, потом нижний
+        playSfx(SFX.Servo, 0.5, 1.05)
+        waitFor(go(a, "FrontA", true, 0.38, Back, EOut))
+        if not alive() then
+                return
+        end
+        pause(0.1)
+        if not alive() then
+                return
+        end
+        playSfx(SFX.Servo, 0.5, 0.95)
+        waitFor(go(a, "FrontB", true, 0.38, Back, EOut))
+        if not alive() then
+                return
+        end
+        shake(0.15)
+        ui.progress(0.92)
+
+        -- 7. ФИНАЛ: весь неон вспыхивает, с дула — ударная волна, оружие готово
+        playSfx(SFX.PowerUp, 0.9, 1)
+        for _, e in ipairs(a.glows) do
+                flashOn(e)
+        end
+        for _, em in ipairs(a.tips) do
+                burst(em, 16)
+        end
+        local tip = a.tipParts[1]
+        local fdir
+        if a.aimPoint and (a.aimPoint - tip.Position).Magnitude > 0.5 then
+                fdir = (a.aimPoint - tip.Position).Unit
+        else
+                fdir = a.hrp.CFrame.LookVector
+        end
+        spawnShockwave(tip.Position + fdir * 0.4, fdir, 4.5 * a.scale, THEME.on)
+        pulse(a, 7, 1.6)
+        shake(0.7)
+        fovPunch(5, 0.05, 0.3)
+        ui.progress(1)
+        a.ready = true
+        ui.setStatus("ready", true)
+        bindFireImpl()
+end
+
+--------------------------------------------------------------------
+-- СКЛАДЫВАНИЕ (обратный порядок)
+--------------------------------------------------------------------
+local function runClose(a, id)
+        local function alive()
+                return id == transitionId and a.model.Parent ~= nil
+        end
+
+        -- 1. аварийное гашение: неон мигает и умирает
+        playSfx(SFX.PowerDown, 0.8, 1)
+        setEnergy(a, false, 0.15)
+        for i, e in ipairs(a.glows) do
+                if not alive() then
+                        return
+                end
+                setGlow(e, false, 0.12)
+                if i % 2 == 0 then
+                        pause(0.04)
+                end
+        end
+        pulse(a, 2.5, 0.4)
+        shake(0.12)
+        pause(0.2)
+        if not alive() then
+                return
+        end
+
+        -- 2. стволы всасываются внутрь
+        playSfx(SFX.Hiss, 0.4, 0.95)
+        local t = go(a, "FrontB", false, 0.28, Quad, EIn)
+        t = go(a, "FrontA", false, 0.28, Quad, EIn) or t
+        waitFor(t)
+        if not alive() then
+                return
+        end
+        shake(0.1)
+        burst(a.sparksBody, 8)
+        ui.progress(0.75)
+
+        -- 3. корпус бьётся в задний упор и отскакивает
+        local bj = a.joints.Body
+        local hit = tween(bj.motor, 0.28, { C0 = bj.closed * CFrame.new(0, 0, 0.07 * a.scale) }, Quad, EIn)
+        waitFor(hit)
+        if not alive() then
+                return
+        end
+        playSfx(SFX.Piston, 0.8, 0.7)
+        shake(0.4)
+        burst(a.sparksBody, 14)
+        tween(bj.motor, 0.12, { C0 = bj.closed }, Quad, EOut)
+        pause(0.1)
+        if not alive() then
+                return
+        end
+        ui.progress(0.6)
+
+        -- 4. крышка захлопывается с лязгом, шток уходит двумя рывками
+        playSfx(SFX.Latch, 0.7, 0.9)
+        waitFor(go(a, "Cap", false, 0.22, Quad, EOut))
+        if not alive() then
+                return
+        end
+        shake(0.18)
+        pulse(a, 2, 0.3)
+        local pj = a.joints.Piston
+        local p1 = tween(pj.motor, 0.18, { C0 = pj.closed:Lerp(pj.open, 0.45) }, Quad, EIn)
+        waitFor(p1)
+        if not alive() then
+                return
+        end
+        local p2 = tween(pj.motor, 0.14, { C0 = pj.closed }, Quart, EIn)
+        waitFor(p2)
+        if not alive() then
+                return
+        end
+        playSfx(SFX.Piston, 0.7, 0.85)
+        shake(0.3)
+        burst(a.sparksNose, 10)
+        ui.progress(0.45)
+
+        -- 5. панели захлопываются по очереди, финальный «замок»
+        for i, name in ipairs(PLATE_NAMES) do
+                task.delay((i - 1) * 0.06 / SETTINGS.speed, function()
+                        if alive() then
+                                playSfx(SFX.Latch, 0.5, 1.1 + math.random() * 0.15)
+                                go(a, name, false, 0.3, Quad, EOut)
+                        end
+                end)
+        end
+        pause(0.06 * #PLATE_NAMES + 0.34)
+        if not alive() then
+                return
+        end
+        burst(a.sparksNose, 16)
+        playSfx(SFX.LockClick, 0.8, 1)
+        flashOn(a.band)
+        pulse(a, 2.5, 0)
+        shake(0.15)
+        ui.progress(0.3)
+
+        -- 6. рука опускается, индикаторы гаснут
+        local poseT = tween(a.pose, 0.45, { Value = 0 }, Quad, EInOut)
+        for i = #a.lamps, 1, -1 do
+                if not alive() then
+                        return
+                end
+                setGlow(a.lamps[i], false, 0.1)
+                pause(0.045)
+        end
+        setGlow(a.band, false, 0.2)
+        waitFor(poseT)
+        if not alive() then
+                return
+        end
+        ui.progress(0.12)
+
+        -- 7. киберпредплечье глитчует обратно в обычную руку
+        if a.morph ~= "out" then
+                if not morphOut(a, alive) then
+                        return
+                end
+        else
+                fadeModel(a, false, 0.2)
+                setRealHidden(a, false)
+        end
+        shake(0.1)
+        ui.progress(0)
+        ui.setStatus("closed", false)
+end
+
+--------------------------------------------------------------------
+-- ПРИЦЕЛИВАНИЕ (каждый кадр, после камеры)
+-- Плечо поворачиваем через C0 сустава: рука целится в точку под курсором.
+-- Анимацию плеча (Transform) обнуляем в PreSimulation/PostSimulation, чтобы рука не болталась.
+--------------------------------------------------------------------
+local function updateAim(a, dt)
+        local hum = a.humanoid
+
+        -- поворот корпуса по камере (как shift lock): AutoRotate выключаем только пока оружие раскрыто
+        local wantFace = SETTINGS.face and a.isOpen
+        if wantFace then
+                if a.savedAutoRotate == nil then
+                        a.savedAutoRotate = hum.AutoRotate
+                end
+                hum.AutoRotate = false
+        elseif a.savedAutoRotate ~= nil then
+                hum.AutoRotate = a.savedAutoRotate
+                a.savedAutoRotate = nil
+        end
+
+        -- (v14) корпус следует за камерой СРАЗУ, до проверок торса и позы:
+        -- раньше слежение стояло после ранних return, и если они срабатывали,
+        -- AutoRotate уже был выключен, а корпус не поворачивался — персонаж
+        -- «застывал» лицом в одну точку (особенно заметно на R15)
+        if wantFace and not hum.Sit then
+                local cam0 = workspace.CurrentCamera
+                if cam0 then
+                        local lv = cam0.CFrame.LookVector
+                        local flat = Vector3.new(lv.X, 0, lv.Z)
+                        if flat.Magnitude > 0.05 then
+                                local hrp = a.hrp
+                                local goal = CFrame.lookAt(hrp.Position, hrp.Position + flat.Unit)
+                                hrp.CFrame = hrp.CFrame:Lerp(goal, 1 - math.exp(-dt * 14))
+                        end
+                end
+        end
+
+        local torso = a.torso
+        if not torso.Parent or not a.shoulder.Parent then
+                return
+        end
+
+        local pose = a.pose.Value
+        if pose < 0.001 then
+                a.shoulder.C0 = a.shoulderBase
+                a.laser.Enabled = false
+                a.aimHit = nil
+                return
+        end
+
+        local cam = workspace.CurrentCamera
+        local tcf = torso.CFrame
+        local pivotWorld = tcf:PointToWorldSpace(a.pivot)
+
+        -- точка прицеливания: луч из камеры через курсор (на телефоне — центр экрана)
+        local point
+        if SETTINGS.aim then
+                local vp
+                if UserInputService.MouseEnabled then
+                        vp = UserInputService:GetMouseLocation()
+                else
+                        vp = cam.ViewportSize / 2
+                end
+                local ray = cam:ViewportPointToRay(vp.X, vp.Y)
+                local hit = workspace:Raycast(ray.Origin, ray.Direction * 600, a.rayParams)
+                point = hit and hit.Position or (ray.Origin + ray.Direction * 600)
+                a.aimHit = hit and hit.Instance or nil
+                if (point - pivotWorld).Magnitude < 6 then
+                        point = pivotWorld + ray.Direction * 100
+                end
+        else
+                point = pivotWorld + tcf.LookVector * 100
+                a.aimHit = nil
+        end
+        a.aimPoint = point
+
+        -- направление в системе торса, с ограничением наклона и «не назад»
+        local dir = tcf:PointToObjectSpace(point) - a.pivot
+        dir = dir.Magnitude > 1e-3 and dir.Unit or Vector3.new(0, 0, -1)
+        if dir.Z > -0.15 then
+                dir = Vector3.new(dir.X, dir.Y, -0.15).Unit
+        end
+        local upv = tcf:VectorToObjectSpace(Vector3.yAxis)
+        local dy = dir:Dot(upv)
+        if math.abs(dy) > 0.95 then
+                local hor = dir - upv * dy
+                hor = hor.Magnitude > 1e-3 and hor.Unit or Vector3.new(0, 0, -1)
+                local ny = dy > 0 and 0.95 or -0.95
+                dir = hor * math.sqrt(1 - ny * ny) + upv * ny
+        end
+
+        -- ось руки (-Y) -> на цель; «перед» руки (-Z) -> вверх
+        local look = CFrame.lookAt(a.pivot, a.pivot + dir, upv)
+        local aimC0 = CFrame.new(a.pivot) * (look.Rotation * CFrame.Angles(math.pi / 2, 0, 0)) * a.c1rot
+        a.shoulder.C0 = a.shoulderBase:Lerp(aimC0, pose)
+
+        -- (v14) слежение корпуса перенесено в начало updateAim (до проверок)
+
+        -- живое оружие: пульс ядра и искры с кончиков стволов
+        if a.ready and a.isOpen then
+                a.idleT = (a.idleT or 0) + dt
+                local s = 0.5 + 0.5 * math.sin(a.idleT * 2.6)
+                if a.core and a.core.Parent then
+                        a.core.Color = THEME.on:Lerp(Color3.new(1, 1, 1), 0.15 + 0.4 * s)
+                end
+                if a.idleT - (a.lastSparkT or 0) > 1.4 then
+                        a.lastSparkT = a.idleT
+                        burst(a.tips[math.random(1, #a.tips)], 2)
+                end
+        end
+        -- лазерный целеуказатель
+        local laserOn = a.ready and a.isOpen and SETTINGS.laser
+        a.laser.Enabled = laserOn
+        if laserOn then
+                local tipPos = a.tipParts[1].Position
+                local v = point - tipPos
+                if v.Magnitude > 1e-3 then
+                        a.aimAtt.WorldPosition = tipPos + v.Unit * math.min(v.Magnitude, 150)
+                end
+        end
+end
+
+local function holdShoulder()
+        local a = arm
+        if a and a.pose.Value > 0.001 and a.shoulder.Parent then
+                a.shoulder.Transform = CFrame.new()
+                -- (v14) R15: гасим анимацию поясницы, иначе UpperTorso качается
+                -- (idle/бег) и вся пушка «плавает» вокруг курсора — на R6 торс
+                -- жёсткий сам по себе, поэтому там такой проблемы не было
+                local w = a.waist
+                if w and w.Parent then
+                        w.Transform = CFrame.new()
+                end
+        end
+end
+
+--------------------------------------------------------------------
+--------------------------------------------------------------------
+-- ОГОНЬ: три режима (плазма / мега-лазер / резак)
+--------------------------------------------------------------------
+local startFling -- (v9) форвард: заполнится в секции ФЛИНГ ниже
+
+local function plasmaFire(a)
+        if a.firing then
+                return
+        end
+        a.firing = true
+        task.delay(CONFIG.FireCooldown * 0.9, function()
+                a.firing = false
+        end)
+
+        a.shot += 1
+        local idx = (a.shot % #a.tipParts) + 1
+        local tip = a.tipParts[idx]
+        local target = a.aimPoint or (tip.Position + a.hrp.CFrame.LookVector * 100)
+
+        -- (v9) флинг при попадании по персонажу: поднимаемся от детали до модели
+        local flingNode = a.aimHit
+        local rootPos = a.hrp and a.hrp.Position
+        while flingNode and flingNode ~= workspace do
+                if flingNode:IsA("Model") and flingNode:FindFirstChildOfClass("Humanoid") then
+                        local tp = flingNode:FindFirstChild("HumanoidRootPart")
+                                or flingNode:FindFirstChildWhichIsA("BasePart")
+                        if tp and rootPos and (tp.Position - rootPos).Magnitude <= CONFIG.FlingRange then
+                                startFling(flingNode, true)
+                        end
+                        break
+                end
+                flingNode = flingNode.Parent
+        end
+
+        -- трассер
+        local tAtt = Instance.new("Attachment")
+        tAtt.Parent = workspace.Terrain
+        tAtt.WorldPosition = target
+
+        local b = Instance.new("Beam")
+        b.Attachment0 = a.muzzles[idx]
+        b.Attachment1 = tAtt
+        b.FaceCamera = true
+        b.LightEmission = 1
+        b.Segments = 1
+        b.Color = ColorSequence.new(Color3.new(1, 1, 1), THEME.on)
+        b.Width0 = 0.7 * a.scale
+        b.Width1 = 0.35 * a.scale
+        b.Parent = tip
+        TweenService:Create(b, TweenInfo.new(0.16), { Width0 = 0, Width1 = 0 }):Play()
+        Debris:AddItem(b, 0.3)
+        playSfx(SFX.Plasma, 0.45, 0.95 + math.random() * 0.15)
+
+        -- вспышка в точке попадания
+        local hitSparks = makeSparkEmitter(tAtt, a.scale)
+        burst(hitSparks, 12)
+        Debris:AddItem(tAtt, 0.9)
+
+        -- вспышка на дуле, свет, отдача корпуса, лёгкая тряска
+        burst(a.tips[idx], 8)
+        pulse(a, 5, 1.6)
+        shake(0.12)
+
+        local j = a.joints.Body
+        local recoil = j.open * CFrame.new(0, 0, 0.28 * a.scale)
+        local t = tween(j.motor, 0.05, { C0 = recoil }, Quad, EOut)
+        t.Completed:Once(function(state)
+                if state == Enum.PlaybackState.Completed and a.model.Parent then
+                        tween(j.motor, 0.18, { C0 = j.open }, Quad, EOut)
+                end
+        end)
+end
+
+--------------------------------------------------------------------
+-- ВОССТАНОВЛЕНИЕ (v6): всё снесённое возвращается на свои места
+--------------------------------------------------------------------
+local restoreQueue = {}
+local restoreIndex = {}
+
+local function saveSnap(p)
+        return {
+                cf = p.CFrame,
+                t = p.Transparency,
+                cc = p.CanCollide,
+                ct = p.CanTouch,
+                cq = p.CanQuery,
+                an = p.Anchored,
+        }
+end
+
+-- kind: "dissolve" (растворена лазером) / "fling" (раскидаана/оторвана) / "cut" (разрезана)
+local function scheduleRestore(part, kind, extra)
+        if not part or not part.Parent or not part:IsA("BasePart") then
+                return
+        end
+        local e = restoreIndex[part]
+        if e then
+                -- уже ждёт возврата: продлеваем таймер и усиливаем тип
+                e.at = os.clock() + CONFIG.RestoreTime
+                if extra then
+                        for k, v in pairs(extra) do
+                                e[k] = v
+                        end
+                end
+                if kind == "cut" then
+                        e.kind = "cut"
+                elseif kind == "dissolve" and e.kind == "fling" then
+                        e.kind = "dissolve"
+                end
+                return
+        end
+        e = {
+                part = part,
+                kind = kind,
+                at = os.clock() + CONFIG.RestoreTime,
+                snap = saveSnap(part),
+        }
+        if extra then
+                for k, v in pairs(extra) do
+                        e[k] = v
+                end
+        end
+        restoreIndex[part] = e
+        table.insert(restoreQueue, e)
+end
+
+-- искры и вспышка при возврате детали
+local function restoreBurst(part, side)
+        local em = Instance.new("ParticleEmitter")
+        em.Color = ColorSequence.new(Color3.new(1, 1, 1), THEME.on)
+        em.LightEmission = 1
+        em.Lifetime = NumberRange.new(0.3, 0.8)
+        em.Rate = 0
+        em.Speed = NumberRange.new(1, 6)
+        em.SpreadAngle = Vector2.new(180, 180)
+        em.Drag = 2
+        em.Size = NumberSequence.new({
+                NumberSequenceKeypoint.new(0, math.clamp(side * 0.1, 0.1, 1.1)),
+                NumberSequenceKeypoint.new(1, 0),
+        })
+        em.Transparency = NumberSequence.new({
+                NumberSequenceKeypoint.new(0, 0.15),
+                NumberSequenceKeypoint.new(1, 1),
+        })
+        em.Parent = part
+        em:Emit(math.clamp(math.floor(side * side * 2), 15, 110))
+        Debris:AddItem(em, 1.5)
+
+        local light = Instance.new("PointLight")
+        light.Color = THEME.on
+        light.Brightness = 6
+        light.Range = math.clamp(side * 1.6, 6, 28)
+        light.Shadows = false
+        light.Parent = part
+        fxtween(light, 0.45, { Brightness = 0 })
+        Debris:AddItem(light, 0.7)
+end
+
+-- само возвращение: телепорт на исходное место + проявление
+local function runRestore(e)
+        local part = e.part
+        restoreIndex[part] = nil
+        -- (v13) снимаем «иммунитет»: раньше activeDissolves[part] оставался
+        -- навсегда, и вернувшаяся деталь больше никогда не сносилась мегой,
+        -- не резалась и не раскидывалась — со временем мега «умирала»
+        activeDissolves[part] = nil
+        -- половинки реза убираем (если ещё живы)
+        if e.halves then
+                for _, h in ipairs(e.halves) do
+                        if h and h.Parent then
+                                fxtween(h, 0.25, { Transparency = 1 }, Quad, EIn)
+                                Debris:AddItem(h, 0.35)
+                        end
+                end
+        end
+        if not (part and part.Parent) then
+                return
+        end
+        local s = e.snap
+        local side = (part.Size.X * part.Size.Y * part.Size.Z) ^ (1 / 3)
+        -- телепорт ровно на исходное место
+        part.Anchored = true
+        part.CFrame = s.cf
+        part.AssemblyLinearVelocity = Vector3.new()
+        part.AssemblyAngularVelocity = Vector3.new()
+        -- свойства как до уничтожения
+        part.CanCollide = s.cc
+        part.CanQuery = s.cq
+        part.CanTouch = s.ct
+        part.Anchored = s.an
+        -- плавное проявление, если деталь была растворена
+        if part.Transparency > s.t + 0.05 then
+                fxtween(part, 0.45, { Transparency = s.t }, Quad, EOut)
+        else
+                part.Transparency = s.t
+        end
+        restoreBurst(part, side)
+end
+
+-- общий цикл возврата
+RunService.Heartbeat:Connect(function()
+        if #restoreQueue == 0 then
+                return
+        end
+        local now = os.clock()
+        local keep, n = {}, 0
+        for i = 1, #restoreQueue do
+                local e = restoreQueue[i]
+                if now >= e.at then
+                        runRestore(e)
+                else
+                        n += 1
+                        keep[n] = e
+                end
+        end
+        restoreQueue = keep
+end)
+
+--------------------------------------------------------------------
+-- МЕГА ЛАЗЕР (режим 2): заряд → залп → растворяет всё на пути, возврат через 50 сек
+--------------------------------------------------------------------
+local function dissolvePart(part, intensity)
+        if not part or not part:IsA("BasePart") or part:IsA("Terrain") then
+                return
+        end
+        if isCharacterPart(part) or activeDissolves[part] then
+                return
+        end
+
+        -- v6: регистрируем возврат на исходное место ДО растворения
+        scheduleRestore(part, "dissolve")
+        activeDissolves[part] = true
+        -- замораживаем деталь на месте, пока она растворена
+        part.Anchored = true
+
+        local vol = part.Size.X * part.Size.Y * part.Size.Z
+        local side = vol ^ (1 / 3)
+
+        -- эффект растворения: вспышка искр + свет + исчезновение
+        local em = Instance.new("ParticleEmitter")
+        em.Color = ColorSequence.new(THEME.on, Color3.new(1, 1, 1))
+        em.LightEmission = 1
+        em.Lifetime = NumberRange.new(0.4, 1.1)
+        em.Rate = 0
+        em.Speed = NumberRange.new(2, 10)
+        em.SpreadAngle = Vector2.new(180, 180)
+        em.Drag = 2
+        em.Size = NumberSequence.new({
+                NumberSequenceKeypoint.new(0, math.clamp(side * 0.12, 0.12, 1.4)),
+                NumberSequenceKeypoint.new(1, 0),
+        })
+        em.Transparency = NumberSequence.new({
+                NumberSequenceKeypoint.new(0, 0.1),
+                NumberSequenceKeypoint.new(1, 1),
+        })
+        em.Parent = part
+        local emit = math.clamp(math.floor(vol * 1.5), 40, 260)
+        if intensity then
+                emit = math.clamp(math.floor(emit * intensity), 10, emit)
+        end
+        em:Emit(emit)
+        Debris:AddItem(em, 2)
+
+        local light = Instance.new("PointLight")
+        light.Color = THEME.on
+        light.Brightness = 8
+        light.Range = math.clamp(side * 2, 8, 40)
+        light.Shadows = false
+        light.Parent = part
+        fxtween(light, 0.5, { Brightness = 0 })
+        Debris:AddItem(light, 0.8)
+
+        fxtween(part, 0.4, { Transparency = 1 }, Quad, EIn)
+        part.CanCollide = false
+        part.CanQuery = false
+        part.CanTouch = false
+
+        -- v6: возврат через CONFIG.RestoreTime из общей очереди восстановления:
+        -- деталь телепортируется ровно на исходное место и плавно проявляется
+end
+
+-- ударная волна раскидывает незакреплённые детали вокруг точки попадания
+local function knockParts(a, pos, radius)
+        local params = OverlapParams.new()
+        params.FilterType = Enum.RaycastFilterType.Exclude
+        params.FilterDescendantsInstances = { a.char, a.model }
+        local parts = workspace:GetPartBoundsInRadius(pos, radius or CONFIG.KnockRadius, params)
+        local count = 0
+        for _, p in ipairs(parts) do
+                if count >= 40 then
+                        break
+                end
+                if not p.Anchored and not isCharacterPart(p) and not activeDissolves[p]
+                        and p:GetMass() < 1200 and p.Transparency < 0.95 then
+                        local d = p.Position - pos
+                        if d.Magnitude > 0.05 then
+                                scheduleRestore(p, "fling") -- v6: раскидаанная деталь вернётся на место
+                                local power = math.clamp(60 / d.Magnitude, 10, 52)
+                                p.AssemblyLinearVelocity = d.Unit * power + Vector3.new(0, power * 0.4, 0)
+                                p.AssemblyAngularVelocity = Vector3.new(math.random() - 0.5, math.random() - 0.5, math.random() - 0.5) * 14
+                                count += 1
+                        end
+                end
+        end
+end
+
+local function megaFire(a)
+        if a.megaBusy then
+                return
+        end
+        a.megaBusy = true
+        task.spawn(function()
+                local chargeSnd -- v7: гул зарядки (глушится при залпе/abort)
+                local tip = a.tipParts[1]
+                local origin = tip.Position
+                local aim = a.aimPoint or (origin + a.hrp.CFrame.LookVector * 200)
+                local dir = aim - origin
+                dir = dir.Magnitude > 0.5 and dir.Unit or a.hrp.CFrame.LookVector
+
+                -- ЗАРЯД: луч растёт, дуло дрожит, свет накаляется
+                local cAtt = Instance.new("Attachment")
+                cAtt.Parent = workspace.Terrain
+                cAtt.WorldPosition = origin + dir * math.min((aim - origin).Magnitude, CONFIG.MegaRange)
+
+                local outer = Instance.new("Beam")
+                outer.Attachment0 = a.muzzles[1]
+                outer.Attachment1 = cAtt
+                outer.FaceCamera = true
+                outer.LightEmission = 1
+                outer.Segments = 1
+                outer.Color = ColorSequence.new(THEME.on)
+                outer.Width0, outer.Width1 = 0.001, 0.001
+                outer.Parent = tip
+
+                local inner = Instance.new("Beam")
+                inner.Attachment0 = a.muzzles[1]
+                inner.Attachment1 = cAtt
+                inner.FaceCamera = true
+                inner.LightEmission = 1
+                inner.Segments = 1
+                inner.Color = ColorSequence.new(Color3.new(1, 1, 1))
+                inner.Width0, inner.Width1 = 0.001, 0.001
+                inner.Parent = tip
+
+                fxtween(outer, CONFIG.MegaCharge, { Width0 = 0.5 * a.scale, Width1 = 0.3 * a.scale }, Quad, EIn)
+                fxtween(inner, CONFIG.MegaCharge, { Width0 = 0.2 * a.scale, Width1 = 0.1 * a.scale }, Quad, EIn)
+                burst(a.tips[1], 28)
+                pulse(a, 2, 1)
+                chargeSnd = playSfx(SFX.PowerUp, 0.55, 1.35, true)
+                for i = 1, 4 do
+                        task.wait(CONFIG.MegaCharge / 4)
+                        if not (a.model and a.model.Parent and arm == a and a.isOpen) then
+                                outer:Destroy()
+                                inner:Destroy()
+                                cAtt:Destroy()
+                                stopSfx(chargeSnd)
+                                a.megaBusy = false
+                                return
+                        end
+                        shake(0.12 + i * 0.16)
+                end
+
+                -- ЗАЛП: белый столб во всю длину, отдача, мощная тряска
+                outer.Color = ColorSequence.new(Color3.new(1, 1, 1), THEME.on)
+                outer.Width0, outer.Width1 = 8 * a.scale, 5.5 * a.scale
+                inner.Width0, inner.Width1 = 3.4 * a.scale, 2.2 * a.scale
+                fxtween(outer, 1.05, { Width0 = 0.001, Width1 = 0.001 }, Quad, EOut)
+                fxtween(inner, 1.15, { Width0 = 0.001, Width1 = 0.001 }, Quad, EOut)
+                Debris:AddItem(outer, 1.35)
+                Debris:AddItem(inner, 1.35)
+                Debris:AddItem(cAtt, 1.5)
+                cAtt.WorldPosition = origin + dir * CONFIG.MegaRange
+                burst(a.tips[1], 60)
+                pulse(a, 10, 1.8)
+                stopSfx(chargeSnd)
+                playSfx(SFX.Plasma, 1.3, 0.5)
+                playSfx(SFX.Piston, 1, 0.6)
+                shake(2.4)
+                fovPunch(12, 0.06, 0.5)
+
+                local j = a.joints.Body
+                local recoil = j.open * CFrame.new(0, 0, 0.9 * a.scale)
+                fxtween(j.motor, 0.06, { C0 = recoil }, Quad, EOut)
+                task.delay(0.09, function()
+                        if a.model.Parent then
+                                fxtween(j.motor, 0.35, { C0 = j.open }, Quad, EOut)
+                        end
+                end)
+
+                -- ПОЛОСА СНОСА: волна идёт от дула и растворяет ВСЁ на пути луча
+                local op = OverlapParams.new()
+                op.FilterType = Enum.RaycastFilterType.Exclude
+                op.FilterDescendantsInstances = { a.char, a.model }
+                op.MaxParts = 40
+                local total = 0
+                local steps = math.ceil(CONFIG.MegaRange / CONFIG.MegaWaveStep)
+                for i = 0, steps do
+                        if not (a.model and a.model.Parent and arm == a and a.isOpen) then
+                                break
+                        end
+                        local d = i == 0 and 4 or math.min(i * CONFIG.MegaWaveStep, CONFIG.MegaRange)
+                        local p = origin + dir * d
+                        local found = workspace:GetPartBoundsInRadius(p, CONFIG.MegaWidth, op)
+                        local did = 0
+                        for _, part in ipairs(found) do
+                                if total >= 320 or did >= 24 then
+                                        break
+                                end
+                                if not activeDissolves[part] and not isCharacterPart(part)
+                                        and part.Transparency < 0.95 then
+                                        local v = part.Size.X * part.Size.Y * part.Size.Z
+                                        if v <= CONFIG.MegaMaxVolume then
+                                                dissolvePart(part, 0.45)
+                                                total += 1
+                                                did += 1
+                                        end
+                                end
+                        end
+                        knockParts(a, p)
+                        if i % 2 == 0 then
+                                spawnShockwave(p, dir, (5 + math.random() * 2) * a.scale, i % 4 == 0 and Color3.new(1, 1, 1) or THEME.on)
+                        end
+                        if i % 4 == 1 then
+                                spawnPieceBurst(p, a.scale * 0.8)
+                        end
+                        shake(0.4)
+                        task.wait(CONFIG.MegaWaveDelay)
+                end
+                spawnShockwave(origin + dir * CONFIG.MegaRange, dir, 14 * a.scale, THEME.on)
+                spawnShockwave(origin + dir * 0.6, dir, 4.5 * a.scale, Color3.new(1, 1, 1))
+
+                task.wait(CONFIG.MegaCooldown)
+                a.megaBusy = false
+        end)
+end
+
+--------------------------------------------------------------------
+-- РЕЗАК (режим 3): зажал — ведёшь линию — стена разваливается надвое
+--------------------------------------------------------------------
+local function faceAxisFromNormal(cf, n)
+        local ln = cf:VectorToObjectSpace(n)
+        local ax, ay, az = math.abs(ln.X), math.abs(ln.Y), math.abs(ln.Z)
+        if ax >= ay and ax >= az then
+                return 1
+        elseif ay >= az then
+                return 2
+        else
+                return 3
+        end
+end
+
+-- линия реза = ось с большим разбросом точек; поперёк неё деталь и рвём
+local function cutStats(part, points, faceAxis)
+        local cf = part.CFrame
+        local minv, maxv
+        for _, p in ipairs(points) do
+                local lp = cf:PointToObjectSpace(p)
+                if not minv then
+                        minv, maxv = lp, lp
+                else
+                        minv = Vector3.new(math.min(minv.X, lp.X), math.min(minv.Y, lp.Y), math.min(minv.Z, lp.Z))
+                        maxv = Vector3.new(math.max(maxv.X, lp.X), math.max(maxv.Y, lp.Y), math.max(maxv.Z, lp.Z))
+                end
+        end
+        local spread = maxv - minv
+        local a1, a2
+        if faceAxis == 1 then
+                a1, a2 = 2, 3
+        elseif faceAxis == 2 then
+                a1, a2 = 1, 3
+        else
+                a1, a2 = 1, 2
+        end
+        local lineAxis, sepAxis
+        if axisVal(spread, a1) >= axisVal(spread, a2) then
+                lineAxis, sepAxis = a1, a2
+        else
+                lineAxis, sepAxis = a2, a1
+        end
+        local extent = axisVal(part.Size, lineAxis)
+        local lineLen = axisVal(spread, lineAxis)
+        local need = math.clamp(extent * 0.6, CONFIG.CutNeedMin, CONFIG.CutNeedMax)
+        local progress = math.clamp(lineLen / math.max(need, 0.1), 0, 1)
+        local cutCoord = (axisVal(minv, sepAxis) + axisVal(maxv, sepAxis)) / 2
+        local lineCenter = (axisVal(minv, lineAxis) + axisVal(maxv, lineAxis)) / 2
+        return lineAxis, sepAxis, cutCoord, lineCenter, lineLen, progress
+end
+
+local function ensureCutSpark()
+        if cut.sparkPart and cut.sparkPart.Parent then
+                return
+        end
+        cut.sparkPart = Instance.new("Part")
+        cut.sparkPart.Name = "RickCutSpark"
+        cut.sparkPart.Size = Vector3.new(0.2, 0.2, 0.2)
+        cut.sparkPart.Transparency = 1
+        cut.sparkPart.Anchored = true
+        cut.sparkPart.CanCollide = false
+        cut.sparkPart.CanQuery = false
+        cut.sparkPart.CanTouch = false
+        cut.sparkPart.Parent = ensureFx()
+        cut.sparkEm = makeSparkEmitter(cut.sparkPart, 1)
+end
+
+cutReset = function()
+        cut.part = nil
+        table.clear(cut.points)
+        cut.faceAxis = 1
+        cut.progress = 0
+        cut.lastDot = nil
+        if cut.beam then
+                cut.beam:Destroy()
+                cut.beam = nil
+        end
+        if cut.att then
+                cut.att:Destroy()
+                cut.att = nil
+        end
+        stopSfx(cut.snd)
+        cut.snd = nil
+end
+
+-- (v12) мягкий сброс: деталь под лучом сменилась — забываем старую линию реза,
+-- но НЕ трогаем луч/спарк/звук. Полный cutReset здесь ломал cutTick: он
+-- обнулял cut.beam, а код в этом же кадре писал cut.beam.Color -> «attempt
+-- to index nil with 'Color'» (30 ошибок в консоли + смерть цикла огня).
+cutSoftReset = function()
+        cut.part = nil
+        table.clear(cut.points)
+        cut.faceAxis = 1
+        cut.progress = 0
+        cut.lastDot = nil
+end
+
+-- разрез одной детали плоскостью: n — нормаль плоскости (мир), p0 — точка на плоскости
+-- quiet — без искр (когда режем сразу много деталей за раз)
+local function slicePart(a, part, n, p0, quiet)
+        if not part or not part.Parent then
+                return false
+        end
+        if isCharacterPart(part) or activeDissolves[part] or part.Transparency >= 0.95 then
+                return false
+        end
+
+        -- (v13) свойство Shape есть только у Part: у UnionOperation/MeshPart/
+        -- WedgePart его нет — чтение part.Shape роняло весь рез ошибкой
+        -- «Shape is not a valid member of UnionOperation». Считаем их не-блоками.
+        local shape = part:IsA("Part") and part.Shape or nil
+        if shape ~= Enum.PartType.Block then
+                -- не блок — просто отрываем с физикой
+                scheduleRestore(part, "fling") -- v6: вернётся на место
+                part.Anchored = false
+                local away = part.Position - a.hrp.Position
+                away = away.Magnitude > 0.5 and away.Unit or Vector3.new(0, 1, 0)
+                part.AssemblyLinearVelocity = away * 14 + Vector3.new(0, 8, 0)
+                part.AssemblyAngularVelocity = Vector3.new(math.random() - 0.5, math.random() - 0.5, math.random() - 0.5) * 10
+                spawnPieceBurst(part.Position, a.scale)
+                return true
+        end
+
+        -- локальная ось детали, ближе всех к нормали плоскости
+        local ln = part.CFrame:VectorToObjectSpace(n)
+        local sepAxis, best = 1, math.abs(ln.X)
+        if math.abs(ln.Y) > best then
+                sepAxis, best = 2, math.abs(ln.Y)
+        end
+        if math.abs(ln.Z) > best then
+                sepAxis, best = 3, math.abs(ln.Z)
+        end
+        local axisWorld = part.CFrame:VectorToWorldSpace(AXIS_VEC[sepAxis])
+        local denom = axisWorld:Dot(n)
+        if math.abs(denom) < 0.2 then
+                return false
+        end
+
+        -- где плоскость пересекает эту ось (в координатах детали)
+        local cutCoord = (p0 - part.Position):Dot(n) / denom
+        local size = part.Size
+        local half = axisVal(size, sepAxis) / 2
+        if math.abs(cutCoord) > half - 0.05 then
+                return false -- плоскость не задевает деталь
+        end
+        local c = math.clamp(cutCoord, -half + 0.15, half - 0.15)
+        local sizeA = c + half
+        local sizeB = axisVal(size, sepAxis) - sizeA
+        if sizeA < 0.15 or sizeB < 0.15 then
+                -- слишком тонкий кусок — отрываем деталь целиком, чтобы эффект был всегда
+                scheduleRestore(part, "fling") -- v6: вернётся на место
+                part.Anchored = false
+                local away = part.Position - a.hrp.Position
+                away = away.Magnitude > 0.5 and away.Unit or Vector3.new(0, 1, 0)
+                part.AssemblyLinearVelocity = away * 10 + Vector3.new(0, 6, 0)
+                part.AssemblyAngularVelocity = Vector3.new(math.random() - 0.5, math.random() - 0.5, math.random() - 0.5) * 8
+                spawnPieceBurst(part.Position, a.scale)
+                return true
+        end
+
+        local halves = {} -- v6: помним половинки, чтобы убрать их при возврате
+        for _, info in ipairs({
+                { sizeA, -half + sizeA / 2, -1 },
+                { sizeB, half - sizeB / 2, 1 },
+        }) do
+                local piece = Instance.new("Part")
+                piece.Name = "RickCutPiece"
+                piece.Size = withAxisSize(size, sepAxis, info[1])
+                piece.CFrame = part.CFrame * CFrame.new(AXIS_VEC[sepAxis] * info[2])
+                piece.Material = part.Material
+                piece.Color = part.Color
+                piece.Reflectance = part.Reflectance
+                piece.Transparency = part.Transparency
+                piece.Anchored = false
+                piece.CanCollide = true
+                piece.TopSurface = Enum.SurfaceType.Smooth
+                piece.BottomSurface = Enum.SurfaceType.Smooth
+                piece.Parent = ensureFx()
+                pcall(function()
+                        piece.CollisionGroup = part.CollisionGroup
+                end)
+                -- половинки расходятся от плоскости реза и падают с физикой
+                piece.AssemblyLinearVelocity = axisWorld * info[3] * (3.5 + math.random() * 3)
+                        + Vector3.new((math.random() - 0.5) * 2.5, 1.5 + math.random() * 2, (math.random() - 0.5) * 2.5)
+                piece.AssemblyAngularVelocity = Vector3.new(math.random() - 0.5, math.random() - 0.5, math.random() - 0.5) * 7
+                task.delay(CONFIG.PiecesLifetime - 1.5, function()
+                        if piece.Parent then
+                                fxtween(piece, 1.4, { Transparency = 1 }, Quad, EIn)
+                        end
+                end)
+                Debris:AddItem(piece, CONFIG.PiecesLifetime)
+                table.insert(halves, piece) -- v6
+        end
+
+        if not quiet then
+                spawnPieceBurst(part.CFrame:PointToWorldSpace(AXIS_VEC[sepAxis] * c), a.scale)
+        end
+        -- v6: оригинал не удаляем — прячем и ставим в очередь возврата.
+        -- Через RestoreTime секунд половинки исчезнут, а целая деталь
+        -- вернётся ровно на своё место.
+        scheduleRestore(part, "cut", { halves = halves })
+        part.Transparency = 1
+        part.CanCollide = false
+        part.CanQuery = false
+        part.CanTouch = false
+        part.Anchored = true
+        return true
+end
+
+local function cutFinish(a)
+        local part = cut.part
+        local sepAxis, cutCoord = cut.sepAxis, cut.cutCoord
+        local pts = {}
+        for _, p in ipairs(cut.points) do
+                table.insert(pts, p)
+        end
+        cutReset()
+        if not (part and part.Parent) then
+                return
+        end
+
+        -- плоскость реза в мировых координатах
+        local n = part.CFrame:VectorToWorldSpace(AXIS_VEC[sepAxis])
+        local p0 = (part.CFrame * CFrame.new(AXIS_VEC[sepAxis] * cutCoord)).Position
+
+        -- цели: сама деталь + (если она внутри модели) детали модели рядом с линией
+        local targets = { part }
+        local model = part:FindFirstAncestorOfClass("Model")
+        if model and model ~= workspace and model ~= a.char then
+                local lcp = #pts > 0 and pts[1] or part.Position
+                for _, o in ipairs(model:GetDescendants()) do
+                        if #targets >= CONFIG.CutMaxTargets then
+                                break
+                        end
+                        if o:IsA("BasePart") and o ~= part and o.Parent and not isCharacterPart(o) and not activeDissolves[o]
+                                and o.Transparency < 0.95 and (o.Position - lcp).Magnitude <= 130 then
+                                table.insert(targets, o)
+                        end
+                end
+        end
+
+        -- раскалённая кромка ровно по прочерченной линии
+        if #pts >= 2 then
+                local p1, p2 = pts[1], pts[#pts]
+                if (p2 - p1).Magnitude > 0.5 then
+                        local edge = Instance.new("Part")
+                        edge.Name = "RickCutEdge"
+                        edge.Size = Vector3.new(0.16, 0.16, math.clamp((p2 - p1).Magnitude, 1, 90))
+                        edge.CFrame = CFrame.lookAt((p1 + p2) / 2, p2)
+                        edge.Anchored = true
+                        edge.CanCollide = false
+                        edge.CanQuery = false
+                        edge.CanTouch = false
+                        edge.Material = Enum.Material.Neon
+                        edge.Color = Color3.new(1, 1, 1)
+                        edge.Parent = ensureFx()
+                        fxtween(edge, 0.9, { Color = THEME.on, Transparency = 1 }, Quad, EOut)
+                        Debris:AddItem(edge, 1.1)
+                end
+        end
+
+        -- режем каждую деталь, которую плоскость реально пересекает
+        local done = 0
+        for _, o in ipairs(targets) do
+                if o.Parent and not activeDissolves[o] and o.Transparency < 0.95 then
+                        local lo = o.CFrame:VectorToObjectSpace(n)
+                        local halfN = math.abs(lo.X) * o.Size.X / 2 + math.abs(lo.Y) * o.Size.Y / 2 + math.abs(lo.Z) * o.Size.Z / 2
+                        local off = math.abs((o.Position - p0):Dot(n))
+                        if off <= halfN + 0.2 then
+                                if slicePart(a, o, n, p0, done % 3 ~= 0) then
+                                        done += 1
+                                end
+                        end
+                end
+        end
+
+        if done > 0 then
+                playSfx(SFX.Piston, 0.9, 0.75)
+                playSfx(SFX.Latch, 0.5, 1.15)
+                spawnPieceBurst(p0, a.scale * 1.2)
+                shake(1.1)
+                pulse(a, 7, 1.6)
+                fovPunch(4, 0.04, 0.25)
+        end
+end
+
+-- отпустил кнопку: дорезать, если линия достаточно длинная
+cutRelease = function()
+        local a = arm
+        if not (a and a.ready and a.isOpen and SETTINGS.mode == 3) then
+                cutReset()
+                return
+        end
+        if cut.part and #cut.points >= 3 and cut.progress >= CONFIG.CutMinProgress then
+                cutFinish(a)
+        else
+                cutReset()
+        end
+end
+
+local function cutTick(a)
+        local muzzle = a.tipParts[1]
+        local origin = muzzle.Position
+        local target = a.aimPoint or (origin + a.hrp.CFrame.LookVector * 120)
+        local dir = target - origin
+        if dir.Magnitude < 0.5 then
+                return
+        end
+        dir = dir.Unit
+
+        local ray = workspace:Raycast(origin, dir * CONFIG.MegaRange, a.fxRay)
+        local hitPart, hitPos, hitNormal
+        if ray then
+                hitPart, hitPos, hitNormal = ray.Instance, ray.Position, ray.Normal
+        else
+                hitPos = origin + dir * 200
+        end
+        if hitPart and activeDissolves[hitPart] then
+                hitPart = nil -- сквозь растворённое луч проходит свободно
+        end
+
+        -- луч резака: тонкая «нить», ширина дрожит от нагрузки
+        if not cut.att then
+                cut.att = Instance.new("Attachment")
+                cut.att.Parent = workspace.Terrain
+        end
+        cut.att.WorldPosition = hitPos
+        if not cut.beam then
+                cut.beam = Instance.new("Beam")
+                cut.beam.Attachment0 = a.muzzles[1]
+                cut.beam.Attachment1 = cut.att
+                cut.beam.FaceCamera = true
+                cut.beam.LightEmission = 1
+                cut.beam.Segments = 1
+                cut.beam.Transparency = NumberSequence.new(0.1)
+                cut.beam.Parent = muzzle
+                cut.snd = playSfx(SFX.Hiss, 0.5, 1.15, true)
+        end
+        local w = 0.085 * a.scale * (1 + 0.2 * math.sin(os.clock() * 22))
+        cut.beam.Width0, cut.beam.Width1 = w, w * 0.8
+
+        if not hitPart or isCharacterPart(hitPart) then
+                cut.beam.Color = ColorSequence.new(Color3.new(1, 1, 1))
+                return
+        end
+
+        if cut.part ~= hitPart then
+                cutSoftReset() -- (v12) был полный cutReset — он убивал cut.beam
+                cut.part = hitPart
+                cut.faceAxis = faceAxisFromNormal(hitPart.CFrame, hitNormal)
+        end
+        if not cut.beam then
+                return -- (v12) страховка: луча нет — тихо ждём следующий кадр
+        end
+
+        local pts = cut.points
+        local lastP = pts[#pts]
+        if not lastP or (lastP - hitPos).Magnitude > 0.1 then
+                if #pts < 500 then
+                        table.insert(pts, hitPos)
+                end
+        end
+
+        if #pts < 3 then
+                cut.beam.Color = ColorSequence.new(THEME.on, Color3.new(1, 1, 1))
+                return
+        end
+
+        local lineAxis, sepAxis, cutCoord, lineCenter, lineLen, progress = cutStats(hitPart, pts, cut.faceAxis)
+        cut.lineAxis, cut.sepAxis = lineAxis, sepAxis
+        cut.cutCoord, cut.lineCenter, cut.lineLen = cutCoord, lineCenter, lineLen
+        cut.progress = progress
+
+        -- луч гудит и дрожит: лёгкая тряска, растущая с глубиной реза
+        shake(0.05 + progress * 0.12)
+
+        -- чем ближе к концу реза, тем горячее луч: тема → белый → оранжевый
+        local col = THEME.on:Lerp(Color3.new(1, 1, 1), math.clamp(progress * 1.3, 0, 1))
+        if progress > 0.6 then
+                col = col:Lerp(Color3.fromRGB(255, 140, 30), (progress - 0.6) * 2.2)
+        end
+        cut.beam.Color = ColorSequence.new(Color3.new(1, 1, 1), col)
+
+        -- светящиеся метки вдоль линии реза
+        if not cut.lastDot or (cut.lastDot - hitPos).Magnitude > CONFIG.CutDotEvery then
+                cut.lastDot = hitPos
+                spawnCutDot(hitPos, col, a.scale)
+        end
+
+        -- искры из точки реза
+        ensureCutSpark()
+        if os.clock() - cut.lastSparkT > 0.06 then
+                cut.lastSparkT = os.clock()
+                cut.sparkPart.CFrame = CFrame.new(hitPos)
+                if cut.sparkEm then
+                        cut.sparkEm:Emit(3)
+                end
+        end
+
+        -- линия прорезана до конца — стена падает сама
+        if progress >= CONFIG.CutAutoAt then
+                cutFinish(a)
+        end
+end
+
+bindFireImpl = function()
+        ContextActionService:BindActionAtPriority(CONFIG.FireAction, function(_, state)
+                if state == Enum.UserInputState.Begin then
+                        if not fireHeld then
+                                fireHeld = true
+                                task.spawn(function()
+                                        while fireHeld and arm and arm.ready do
+                                                if SETTINGS.mode == 1 then
+                                                        plasmaFire(arm)
+                                                        task.wait(CONFIG.FireCooldown)
+                                                elseif SETTINGS.mode == 2 then
+                                                        megaFire(arm)
+                                                        task.wait(0.1)
+                                                else
+                                                        cutTick(arm)
+                                                        task.wait()
+                                                end
+                                        end
+                                        cutRelease()
+                                end)
+                        end
+                elseif state == Enum.UserInputState.End or state == Enum.UserInputState.Cancel then
+                        fireHeld = false
+                end
+                return Enum.ContextActionResult.Sink
+        end, true, Enum.ContextActionPriority.High.Value, Enum.UserInputType.MouseButton1, Enum.KeyCode.ButtonR2)
+        ContextActionService:SetTitle(CONFIG.FireAction, MODES[SETTINGS.mode].btn)
+end
+
+--------------------------------------------------------------------
+-- ТЕМА (цвет энергии)
+--------------------------------------------------------------------
+local function applyTheme(index)
+        local c = THEMES[index].color
+        THEME.index, THEME.on, THEME.off = index, c, dim(c)
+
+        local a = arm
+        if a then
+                for _, e in ipairs(a.themed) do
+                        e.on, e.off = THEME.on, THEME.off
+                        uiTween(e.part, 0.25, { Color = e.lit and e.on or e.off })
+                end
+                a.energy.Color = ColorSequence.new(THEME.on)
+                a.laser.Color = ColorSequence.new(THEME.on)
+                a.light.Color = THEME.on
+                for _, em in ipairs(a.emitters) do
+                        em.Color = ColorSequence.new(THEME.on, C.OrangeOn)
+                end
+        end
+        ui.theme()
+end
+
+--------------------------------------------------------------------
+-- ПЕРЕКЛЮЧАТЕЛЬ (G / кнопка меню / кнопка на телефоне)
+--------------------------------------------------------------------
+local function ensureArm()
+        local char = player.Character
+        if not char or not char.Parent then
+                return nil
+        end
+        local hum = char:FindFirstChildOfClass("Humanoid")
+        if not hum or hum.Health <= 0 then
+                return nil
+        end
+
+        if arm and arm.model.Parent == char then
+                return arm
+        end
+        if building then
+                return nil
+        end
+
+        building = true
+        if arm then
+                destroyArm()
+        end
+        local ok, result = pcall(function()
+                local rig = detectRig(char)
+                if not rig then
+                        return nil
+                end
+                return buildArm(char, rig)
+        end)
+        building = false
+
+        if not ok then
+                warn("[RickRoboArm] ошибка сборки: " .. tostring(result))
+                return nil
+        end
+        arm = result
+        if arm then
+                ui.setRig(arm.rigName)
+        end
+        return arm
+end
+
+local function toggle()
+        local a = ensureArm()
+        if not a then
+                return
+        end
+
+        transitionId += 1
+        local id = transitionId
+        cancelTweens() -- повторное нажатие посреди анимации плавно разворачивает её
+        unbindFire()
+
+        a.isOpen = not a.isOpen
+        a.ready = false
+        ui.setStatus("busy", a.isOpen)
+
+        if a.isOpen then
+                task.spawn(runOpen, a, id)
+        else
+                task.spawn(runClose, a, id)
+        end
+end
+
+local function onToggleAction(_, inputState)
+        if inputState == Enum.UserInputState.Begin then
+                task.spawn(toggle)
+        end
+        return Enum.ContextActionResult.Sink
+end
+
+--------------------------------------------------------------------
+-- СМЕНА РЕЖИМА СТРЕЛЬБЫ (T / кнопка «РЕЖИМ» / кнопки в меню)
+--------------------------------------------------------------------
+local function setFireMode(i)
+        i = ((i - 1) % #MODES) + 1
+        if SETTINGS.mode == i then
+                return
+        end
+        SETTINGS.mode = i
+        playSfx(SFX.LockClick, 0.45, 1.55)
+        if i ~= 3 and cutReset then
+                cutReset() -- сменили режим посреди реза — линию сбрасываем
+        end
+        if ui.setMode then
+                ui.setMode(i)
+        end
+        pcall(function()
+                ContextActionService:SetTitle(CONFIG.FireAction, MODES[i].btn)
+        end)
+        local a = arm
+        if a and a.ready and a.isOpen then
+                -- короткий «чик» смены режима
+                pulse(a, 4.5, 1.6)
+                burst(a.tips[1], 10)
+                for _, e in ipairs(a.glows) do
+                        flashOn(e)
+                end
+                shake(0.12)
+        end
+end
+
+local function cycleMode()
+        setFireMode(SETTINGS.mode + 1)
+end
+
+local function onModeAction(_, inputState)
+        if inputState == Enum.UserInputState.Begin then
+                task.spawn(cycleMode)
+        end
+        return Enum.ContextActionResult.Sink
+end
+
+--------------------------------------------------------------------
+-- GUI
+--------------------------------------------------------------------
+local TEXT = Color3.fromRGB(232, 238, 244)
+local MUTED = Color3.fromRGB(112, 128, 146)
+local CARD = Color3.fromRGB(21, 28, 38)
+local CARD_HOVER = Color3.fromRGB(28, 37, 50)
+local OFFTRACK = Color3.fromRGB(44, 53, 66)
+
+local function make(class, props, children)
+        local inst = Instance.new(class)
+        for k, v in pairs(props) do
+                if k ~= "Parent" then
+                        inst[k] = v
+                end
+        end
+        for _, ch in ipairs(children or {}) do
+                ch.Parent = inst
+        end
+        if props.Parent then
+                inst.Parent = props.Parent
+        end
+        return inst
+end
+
+local function corner(parent, px)
+        return make("UICorner", { CornerRadius = UDim.new(0, px or 12), Parent = parent })
+end
+
+local function round(parent)
+        return make("UICorner", { CornerRadius = UDim.new(1, 0), Parent = parent })
+end
+
+local function buildGui()
+        local playerGui = player:WaitForChild("PlayerGui")
+        for _, n in ipairs({ "RickRoboArmGui", "RickRoboArmCrosshair" }) do
+                local old = playerGui:FindFirstChild(n)
+                if old then
+                        old:Destroy()
+                end
+        end
+
+        local accents = {}
+        local function onAccent(fn)
+                table.insert(accents, fn)
+                fn(THEME.on)
+        end
+        ui.theme = function()
+                for _, fn in ipairs(accents) do
+                        fn(THEME.on)
+                end
+        end
+
+        local gui = make("ScreenGui", {
+                Name = "RickRoboArmGui",
+                ResetOnSpawn = false,
+                IgnoreGuiInset = true,
+                DisplayOrder = 50,
+                ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+                Parent = playerGui,
+        })
+
+        local WIN_W, HEAD_H, TABS_H, PAGE_H = 300, 58, 38, 262
+        local FULL_H = HEAD_H + TABS_H + PAGE_H
+        local expanded = not (UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled)
+
+        --================================================================ окно
+        local window = make("Frame", {
+                Name = "Window",
+                AnchorPoint = Vector2.new(0, 0.5),
+                Position = UDim2.new(0, -WIN_W - 30, 0.5, 0),
+                Size = UDim2.fromOffset(WIN_W, expanded and FULL_H or HEAD_H),
+                BackgroundColor3 = Color3.new(1, 1, 1),
+                BackgroundTransparency = 0.03,
+                BorderSizePixel = 0,
+                ClipsDescendants = true,
+                Active = true,
+                Parent = gui,
+        })
+        corner(window, 18)
+        local winScale = make("UIScale", { Parent = window })
+        make("UIGradient", {
+                Rotation = 90,
+                Color = ColorSequence.new(Color3.fromRGB(19, 26, 36), Color3.fromRGB(9, 12, 17)),
+                Parent = window,
+        })
+        local winStroke = make("UIStroke", {
+                Thickness = 2,
+                Color = Color3.new(1, 1, 1),
+                ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+                Parent = window,
+        })
+        local strokeGrad = make("UIGradient", { Parent = winStroke })
+        onAccent(function(c)
+                strokeGrad.Color = ColorSequence.new({
+                        ColorSequenceKeypoint.new(0, c),
+                        ColorSequenceKeypoint.new(0.5, Color3.fromRGB(28, 38, 50)),
+                        ColorSequenceKeypoint.new(1, c),
+                })
+        end)
+
+        local function rescale()
+                local cam = workspace.CurrentCamera
+                if cam then
+                        winScale.Scale = math.clamp(cam.ViewportSize.Y / (FULL_H + 80), 0.6, 1.1)
+                end
+        end
+        rescale()
+        if workspace.CurrentCamera then
+                workspace.CurrentCamera:GetPropertyChangedSignal("ViewportSize"):Connect(rescale)
+        end
+
+        --================================================================ шапка
+        local header = make("Frame", {
+                Name = "Header",
+                Size = UDim2.new(1, 0, 0, HEAD_H),
+                BackgroundTransparency = 1,
+                Active = true,
+                Parent = window,
+        })
+
+        local portal = make("Frame", {
+                Size = UDim2.fromOffset(34, 34),
+                Position = UDim2.new(0, 16, 0.5, -17),
+                BackgroundColor3 = Color3.fromRGB(7, 10, 14),
+                Parent = header,
+        })
+        round(portal)
+        local portalStroke = make("UIStroke", { Thickness = 3, Color = Color3.new(1, 1, 1), Parent = portal })
+        local portalGrad = make("UIGradient", {
+                Transparency = NumberSequence.new({
+                        NumberSequenceKeypoint.new(0, 0),
+                        NumberSequenceKeypoint.new(0.55, 0.15),
+                        NumberSequenceKeypoint.new(0.75, 1),
+                        NumberSequenceKeypoint.new(1, 0),
+                }),
+                Parent = portalStroke,
+        })
+        local portalDot = make("Frame", {
+                AnchorPoint = Vector2.new(0.5, 0.5),
+                Position = UDim2.fromScale(0.5, 0.5),
+                Size = UDim2.fromOffset(10, 10),
+                Parent = portal,
+        })
+        round(portalDot)
+
+        make("TextLabel", {
+                Position = UDim2.new(0, 60, 0, 11),
+                Size = UDim2.new(1, -110, 0, 20),
+                BackgroundTransparency = 1,
+                Text = "RICK ARM",
+                Font = Enum.Font.GothamBlack,
+                TextSize = 17,
+                TextColor3 = TEXT,
+                TextXAlignment = Enum.TextXAlignment.Left,
+                Parent = header,
+        })
+        make("TextLabel", {
+                Position = UDim2.new(0, 60, 0, 32),
+                Size = UDim2.new(1, -110, 0, 14),
+                BackgroundTransparency = 1,
+                Text = "C-137  •  cyber weapon",
+                Font = Enum.Font.Gotham,
+                TextSize = 11,
+                TextColor3 = MUTED,
+                TextXAlignment = Enum.TextXAlignment.Left,
+                Parent = header,
+        })
+
+        local minBtn = make("TextButton", {
+                AnchorPoint = Vector2.new(1, 0.5),
+                Position = UDim2.new(1, -14, 0.5, 0),
+                Size = UDim2.fromOffset(28, 28),
+                BackgroundColor3 = CARD,
+                Text = expanded and "–" or "+",
+                Font = Enum.Font.GothamBold,
+                TextSize = 16,
+                TextColor3 = TEXT,
+                AutoButtonColor = false,
+                Parent = header,
+        })
+        corner(minBtn, 9)
+        minBtn.MouseEnter:Connect(function()
+                uiTween(minBtn, 0.15, { BackgroundColor3 = CARD_HOVER })
+        end)
+        minBtn.MouseLeave:Connect(function()
+                uiTween(minBtn, 0.15, { BackgroundColor3 = CARD })
+        end)
+
+        onAccent(function(c)
+                portalGrad.Color = ColorSequence.new(c, c:Lerp(Color3.new(1, 1, 1), 0.5))
+                portalDot.BackgroundColor3 = c
+        end)
+
+        local function setExpanded(v)
+                expanded = v
+                minBtn.Text = v and "–" or "+"
+                uiTween(window, 0.3, { Size = UDim2.fromOffset(WIN_W, v and FULL_H or HEAD_H) }, Enum.EasingStyle.Quint, EOut)
+        end
+        minBtn.Activated:Connect(function()
+                setExpanded(not expanded)
+        end)
+
+        -- (v10) телефонная кнопка меню: всегда на экране, открывает/закрывает окно
+        local menuBtn = make("TextButton", {
+                Name = "MenuOpenBtn",
+                Position = UDim2.new(0, 14, 0, 64),
+                Size = UDim2.fromOffset(76, 32),
+                BackgroundColor3 = CARD,
+                Text = "МЕНЮ",
+                Font = Enum.Font.GothamBold,
+                TextSize = 12,
+                TextColor3 = TEXT,
+                AutoButtonColor = false,
+                Parent = gui,
+        })
+        corner(menuBtn, 10)
+        local menuBtnStroke = make("UIStroke", { Thickness = 1.5, Transparency = 0.35, Parent = menuBtn })
+        onAccent(function(c)
+                menuBtnStroke.Color = c
+        end)
+        menuBtn.Activated:Connect(function()
+                setExpanded(not expanded)
+        end)
+
+        -- перетаскивание окна за шапку
+        local dragging, dragStart, startPos = false, nil, nil
+        header.InputBegan:Connect(function(input)
+                if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+                        dragging = true
+                        dragStart = input.Position
+                        startPos = window.Position
+                        input.Changed:Connect(function()
+                                if input.UserInputState == Enum.UserInputState.End then
+                                        dragging = false
+                                end
+                        end)
+                end
+        end)
+        UserInputService.InputChanged:Connect(function(input)
+                if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+                        local d = input.Position - dragStart
+                        window.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
+                end
+        end)
+
+        --================================================================ вкладки
+        local tabsBar = make("Frame", {
+                Position = UDim2.new(0, 0, 0, HEAD_H),
+                Size = UDim2.new(1, 0, 0, TABS_H),
+                BackgroundTransparency = 1,
+                Parent = window,
+        })
+        make("Frame", {
+                Position = UDim2.new(0, 14, 0, 0),
+                Size = UDim2.new(1, -28, 0, 1),
+                BackgroundColor3 = Color3.new(1, 1, 1),
+                BackgroundTransparency = 0.92,
+                BorderSizePixel = 0,
+                Parent = tabsBar,
+        })
+        make("Frame", {
+                Position = UDim2.new(0, 14, 1, -1),
+                Size = UDim2.new(1, -28, 0, 1),
+                BackgroundColor3 = Color3.new(1, 1, 1),
+                BackgroundTransparency = 0.92,
+                BorderSizePixel = 0,
+                Parent = tabsBar,
+        })
+
+        local tabNames = { "ОРУЖИЕ", "ПРИЦЕЛ", "ВИД" }
+        local tabBtns, pages = {}, {}
+        local currentTab = 1
+
+        local indicator = make("Frame", {
+                Size = UDim2.new(1 / 3, -28, 0, 3),
+                Position = UDim2.new(0, 14, 1, -3),
+                BorderSizePixel = 0,
+                Parent = tabsBar,
+        })
+        round(indicator)
+
+        local pagesHolder = make("Frame", {
+                Position = UDim2.new(0, 0, 0, HEAD_H + TABS_H),
+                Size = UDim2.new(1, 0, 0, PAGE_H),
+                BackgroundTransparency = 1,
+                ClipsDescendants = true,
+                Parent = window,
+        })
+
+        local function newPage()
+                local p = make("Frame", {
+                        Size = UDim2.fromScale(1, 1),
+                        BackgroundTransparency = 1,
+                        Visible = false,
+                        Parent = pagesHolder,
+                })
+                make("UIPadding", {
+                        PaddingLeft = UDim.new(0, 14),
+                        PaddingRight = UDim.new(0, 14),
+                        PaddingTop = UDim.new(0, 12),
+                        PaddingBottom = UDim.new(0, 8),
+                        Parent = p,
+                })
+                make("UIListLayout", { Padding = UDim.new(0, 8), SortOrder = Enum.SortOrder.LayoutOrder, Parent = p })
+                table.insert(pages, p)
+                return p
+        end
+
+        local order = 0
+        local function nextOrder()
+                order += 1
+                return order
+        end
+
+        local function refreshTabs()
+                for k, b in ipairs(tabBtns) do
+                        uiTween(b, 0.15, { TextColor3 = (k == currentTab) and THEME.on or MUTED })
+                end
+        end
+
+        local function selectTab(i)
+                currentTab = i
+                refreshTabs()
+                uiTween(indicator, 0.28, { Position = UDim2.new((i - 1) / 3, 14, 1, -3) }, Enum.EasingStyle.Quint, EOut)
+                for k, p in ipairs(pages) do
+                        if k == i then
+                                p.Visible = true
+                                p.Position = UDim2.new(0, 16, 0, 0)
+                                uiTween(p, 0.28, { Position = UDim2.new(0, 0, 0, 0) }, Enum.EasingStyle.Quint, EOut)
+                        else
+                                p.Visible = false
+                        end
+                end
+        end
+
+        for i, name in ipairs(tabNames) do
+                local b = make("TextButton", {
+                        Position = UDim2.new((i - 1) / 3, 0, 0, 0),
+                        Size = UDim2.new(1 / 3, 0, 1, -3),
+                        BackgroundTransparency = 1,
+                        Text = name,
+                        Font = Enum.Font.GothamBold,
+                        TextSize = 12,
+                        TextColor3 = MUTED,
+                        AutoButtonColor = false,
+                        Parent = tabsBar,
+                })
+                b.Activated:Connect(function()
+                        selectTab(i)
+                end)
+                tabBtns[i] = b
+        end
+        onAccent(function(c)
+                indicator.BackgroundColor3 = c
+                refreshTabs()
+        end)
+
+        --================================================================ общие элементы
+        local function keycap(parent, text)
+                local f = make("TextLabel", {
+                        Size = UDim2.fromOffset(#text * 7 + 14, 20),
+                        BackgroundColor3 = Color3.fromRGB(33, 43, 57),
+                        Text = text,
+                        Font = Enum.Font.GothamBold,
+                        TextSize = 11,
+                        TextColor3 = TEXT,
+                        Parent = parent,
+                })
+                corner(f, 6)
+                make("UIStroke", { Color = Color3.new(1, 1, 1), Transparency = 0.86, Parent = f })
+                return f
+        end
+
+        local function hint(parent, key, text)
+                local g = make("Frame", {
+                        Size = UDim2.new(0, 0, 1, 0),
+                        AutomaticSize = Enum.AutomaticSize.X,
+                        BackgroundTransparency = 1,
+                        LayoutOrder = nextOrder(),
+                        Parent = parent,
+                })
+                make("UIListLayout", {
+                        FillDirection = Enum.FillDirection.Horizontal,
+                        VerticalAlignment = Enum.VerticalAlignment.Center,
+                        Padding = UDim.new(0, 5),
+                        SortOrder = Enum.SortOrder.LayoutOrder,
+                        Parent = g,
+                })
+                keycap(g, key).LayoutOrder = 1
+                make("TextLabel", {
+                        Size = UDim2.new(0, 0, 1, 0),
+                        AutomaticSize = Enum.AutomaticSize.X,
+                        BackgroundTransparency = 1,
+                        Text = text,
+                        Font = Enum.Font.Gotham,
+                        TextSize = 11,
+                        TextColor3 = MUTED,
+                        LayoutOrder = 2,
+                        Parent = g,
+                })
+        end
+
+        local function makeToggle(parent, text, sub, key)
+                local row = make("TextButton", {
+                        Size = UDim2.new(1, 0, 0, 44),
+                        BackgroundColor3 = CARD,
+                        Text = "",
+                        AutoButtonColor = false,
+                        LayoutOrder = nextOrder(),
+                        Parent = parent,
+                })
+                corner(row, 11)
+                make("TextLabel", {
+                        Position = UDim2.new(0, 12, 0, 6),
+                        Size = UDim2.new(1, -78, 0, 18),
+                        BackgroundTransparency = 1,
+                        Text = text,
+                        Font = Enum.Font.GothamMedium,
+                        TextSize = 13,
+                        TextColor3 = TEXT,
+                        TextXAlignment = Enum.TextXAlignment.Left,
+                        Parent = row,
+                })
+                make("TextLabel", {
+                        Position = UDim2.new(0, 12, 0, 24),
+                        Size = UDim2.new(1, -78, 0, 14),
+                        BackgroundTransparency = 1,
+                        Text = sub,
+                        Font = Enum.Font.Gotham,
+                        TextSize = 10,
+                        TextColor3 = MUTED,
+                        TextXAlignment = Enum.TextXAlignment.Left,
+                        Parent = row,
+                })
+                local track = make("Frame", {
+                        AnchorPoint = Vector2.new(1, 0.5),
+                        Position = UDim2.new(1, -12, 0.5, 0),
+                        Size = UDim2.fromOffset(42, 22),
+                        BackgroundColor3 = OFFTRACK,
+                        Parent = row,
+                })
+                round(track)
+                local knob = make("Frame", {
+                        AnchorPoint = Vector2.new(0, 0.5),
+                        Position = UDim2.new(0, 3, 0.5, 0),
+                        Size = UDim2.fromOffset(16, 16),
+                        BackgroundColor3 = Color3.fromRGB(240, 244, 248),
+                        Parent = track,
+                })
+                round(knob)
+
+                local function render(instant)
+                        local on = SETTINGS[key]
+                        local pos = on and UDim2.new(1, -19, 0.5, 0) or UDim2.new(0, 3, 0.5, 0)
+                        local col = on and THEME.on or OFFTRACK
+                        if instant then
+                                knob.Position = pos
+                                track.BackgroundColor3 = col
+                        else
+                                uiTween(knob, 0.2, { Position = pos }, Back, EOut)
+                                uiTween(track, 0.2, { BackgroundColor3 = col })
+                        end
+                end
+                row.MouseEnter:Connect(function()
+                        uiTween(row, 0.15, { BackgroundColor3 = CARD_HOVER })
+                end)
+                row.MouseLeave:Connect(function()
+                        uiTween(row, 0.15, { BackgroundColor3 = CARD })
+                end)
+                row.Activated:Connect(function()
+                        SETTINGS[key] = not SETTINGS[key]
+                        render(false)
+                end)
+                onAccent(function()
+                        render(true)
+                end)
+        end
+
+        --================================================================ страница 1: ОРУЖИЕ
+        local p1 = newPage()
+
+        local statusRow = make("Frame", {
+                Size = UDim2.new(1, 0, 0, 22),
+                BackgroundTransparency = 1,
+                LayoutOrder = nextOrder(),
+                Parent = p1,
+        })
+        local dot = make("Frame", {
+                AnchorPoint = Vector2.new(0, 0.5),
+                Position = UDim2.new(0, 0, 0.5, 0),
+                Size = UDim2.fromOffset(10, 10),
+                BackgroundColor3 = MUTED,
+                Parent = statusRow,
+        })
+        round(dot)
+        local statusText = make("TextLabel", {
+                Position = UDim2.new(0, 20, 0, 0),
+                Size = UDim2.new(1, -80, 1, 0),
+                BackgroundTransparency = 1,
+                Text = "РУКА ЗАКРЫТА",
+                Font = Enum.Font.GothamBold,
+                TextSize = 13,
+                TextColor3 = TEXT,
+                TextXAlignment = Enum.TextXAlignment.Left,
+                Parent = statusRow,
+        })
+        local rigChip = make("TextLabel", {
+                AnchorPoint = Vector2.new(1, 0.5),
+                Position = UDim2.new(1, 0, 0.5, 0),
+                Size = UDim2.fromOffset(46, 20),
+                BackgroundColor3 = CARD,
+                Text = "—",
+                Font = Enum.Font.GothamBold,
+                TextSize = 11,
+                TextColor3 = MUTED,
+                Parent = statusRow,
+        })
+        corner(rigChip, 7)
+
+        local progBox = make("Frame", {
+                Size = UDim2.new(1, 0, 0, 34),
+                BackgroundTransparency = 1,
+                LayoutOrder = nextOrder(),
+                Parent = p1,
+        })
+        make("TextLabel", {
+                Size = UDim2.new(1, -50, 0, 14),
+                BackgroundTransparency = 1,
+                Text = "ГОТОВНОСТЬ ОРУЖИЯ",
+                Font = Enum.Font.GothamBold,
+                TextSize = 10,
+                TextColor3 = MUTED,
+                TextXAlignment = Enum.TextXAlignment.Left,
+                Parent = progBox,
+        })
+        local percent = make("TextLabel", {
+                AnchorPoint = Vector2.new(1, 0),
+                Position = UDim2.new(1, 0, 0, 0),
+                Size = UDim2.fromOffset(50, 14),
+                BackgroundTransparency = 1,
+                Text = "0%",
+                Font = Enum.Font.GothamBold,
+                TextSize = 11,
+                TextXAlignment = Enum.TextXAlignment.Right,
+                Parent = progBox,
+        })
+        local progTrack = make("Frame", {
+                Position = UDim2.new(0, 0, 0, 22),
+                Size = UDim2.new(1, 0, 0, 8),
+                BackgroundColor3 = OFFTRACK,
+                BorderSizePixel = 0,
+                Parent = progBox,
+        })
+        round(progTrack)
+        local progFill = make("Frame", {
+                Size = UDim2.fromScale(0, 1),
+                BackgroundColor3 = Color3.new(1, 1, 1),
+                BorderSizePixel = 0,
+                Parent = progTrack,
+        })
+        round(progFill)
+        local progGrad = make("UIGradient", { Parent = progFill })
+        onAccent(function(c)
+                percent.TextColor3 = c
+                progGrad.Color = ColorSequence.new(c:Lerp(Color3.new(0, 0, 0), 0.35), c)
+        end)
+
+        --================================================================
+        -- РЕЖИМЫ СТРЕЛЬБЫ (Плазма / Мега-лазер / Резак)
+        --================================================================
+        local modeHead = make("Frame", {
+                Size = UDim2.new(1, 0, 0, 14),
+                BackgroundTransparency = 1,
+                LayoutOrder = nextOrder(),
+                Parent = p1,
+        })
+        make("TextLabel", {
+                Size = UDim2.new(0.6, 0, 1, 0),
+                BackgroundTransparency = 1,
+                Text = "РЕЖИМ СТРЕЛЬБЫ",
+                Font = Enum.Font.GothamBold,
+                TextSize = 10,
+                TextColor3 = MUTED,
+                TextXAlignment = Enum.TextXAlignment.Left,
+                Parent = modeHead,
+        })
+        local modeName = make("TextLabel", {
+                AnchorPoint = Vector2.new(1, 0),
+                Position = UDim2.new(1, 0, 0, 0),
+                Size = UDim2.new(0.4, 0, 1, 0),
+                BackgroundTransparency = 1,
+                Text = "",
+                Font = Enum.Font.GothamBold,
+                TextSize = 11,
+                TextXAlignment = Enum.TextXAlignment.Right,
+                Parent = modeHead,
+        })
+        local modeBtns = {}
+        local modeRow = make("Frame", {
+                Size = UDim2.new(1, 0, 0, 38),
+                BackgroundTransparency = 1,
+                LayoutOrder = nextOrder(),
+                Parent = p1,
+        })
+        make("UIListLayout", {
+                FillDirection = Enum.FillDirection.Horizontal,
+                VerticalAlignment = Enum.VerticalAlignment.Center,
+                Padding = UDim.new(0, 6),
+                SortOrder = Enum.SortOrder.LayoutOrder,
+                Parent = modeRow,
+        })
+        for i, m in ipairs(MODES) do
+                local b = make("TextButton", {
+                        Size = UDim2.new(1 / 3, -4, 1, 0),
+                        BackgroundColor3 = CARD,
+                        Text = m.short,
+                        Font = Enum.Font.GothamBold,
+                        TextSize = 11,
+                        TextColor3 = MUTED,
+                        AutoButtonColor = false,
+                        LayoutOrder = i,
+                        Parent = modeRow,
+                })
+                corner(b, 10)
+                modeBtns[i] = { btn = b, stroke = make("UIStroke", { Thickness = 1.5, Color = Color3.new(1, 1, 1), Transparency = 1, Parent = b }) }
+                b.Activated:Connect(function()
+                        setFireMode(i)
+                end)
+        end
+
+        ui.setMode = function(i)
+                modeName.Text = MODES[i].name
+                for k, mb in ipairs(modeBtns) do
+                        local active = k == i
+                        uiTween(mb.btn, 0.15, { BackgroundColor3 = active and THEME.on or CARD })
+                        uiTween(mb.btn, 0.15, { TextColor3 = active and Color3.fromRGB(5, 11, 15) or MUTED })
+                        mb.stroke.Transparency = active and 0.35 or 1
+                end
+        end
+        onAccent(function(c)
+                modeName.TextColor3 = c
+                for k, mb in ipairs(modeBtns) do
+                        if k == SETTINGS.mode then
+                                mb.btn.BackgroundColor3 = c
+                        end
+                end
+        end)
+        ui.setMode(SETTINGS.mode)
+
+        local bigBtn = make("TextButton", {
+                Size = UDim2.new(1, 0, 0, 54),
+                BackgroundColor3 = Color3.new(1, 1, 1),
+                Text = "ТРАНСФОРМАЦИЯ",
+                Font = Enum.Font.GothamBlack,
+                TextSize = 15,
+                TextColor3 = Color3.fromRGB(5, 11, 15),
+                AutoButtonColor = false,
+                LayoutOrder = nextOrder(),
+                Parent = p1,
+        })
+        corner(bigBtn, 13)
+        local bigGrad = make("UIGradient", { Rotation = 20, Parent = bigBtn })
+        local bigScale = make("UIScale", { Parent = bigBtn })
+        local bigKey = make("TextLabel", {
+                AnchorPoint = Vector2.new(1, 0.5),
+                Position = UDim2.new(1, -12, 0.5, 0),
+                Size = UDim2.fromOffset(24, 24),
+                BackgroundColor3 = Color3.fromRGB(5, 11, 15),
+                BackgroundTransparency = 0.25,
+                Text = "G",
+                Font = Enum.Font.GothamBlack,
+                TextSize = 13,
+                TextColor3 = Color3.new(1, 1, 1),
+                Parent = bigBtn,
+        })
+        corner(bigKey, 7)
+        onAccent(function(c)
+                bigGrad.Color = ColorSequence.new(c, c:Lerp(Color3.new(0, 0, 0), 0.45))
+        end)
+        bigBtn.MouseEnter:Connect(function()
+                uiTween(bigBtn, 0.15, { BackgroundTransparency = 0.12 })
+        end)
+        bigBtn.MouseLeave:Connect(function()
+                uiTween(bigBtn, 0.15, { BackgroundTransparency = 0 })
+                uiTween(bigScale, 0.1, { Scale = 1 })
+        end)
+        bigBtn.MouseButton1Down:Connect(function()
+                uiTween(bigScale, 0.08, { Scale = 0.97 })
+        end)
+        bigBtn.MouseButton1Up:Connect(function()
+                uiTween(bigScale, 0.14, { Scale = 1 }, Back, EOut)
+        end)
+        bigBtn.Activated:Connect(function()
+                task.spawn(toggle)
+        end)
+
+        local hintsRow = make("Frame", {
+                Size = UDim2.new(1, 0, 0, 22),
+                BackgroundTransparency = 1,
+                LayoutOrder = nextOrder(),
+                Parent = p1,
+        })
+        make("UIListLayout", {
+                FillDirection = Enum.FillDirection.Horizontal,
+                VerticalAlignment = Enum.VerticalAlignment.Center,
+                Padding = UDim.new(0, 12),
+                SortOrder = Enum.SortOrder.LayoutOrder,
+                Parent = hintsRow,
+        })
+        hint(hintsRow, "G", "рука")
+        hint(hintsRow, "ЛКМ", "огонь")
+        hint(hintsRow, "T", "режим")
+        hint(hintsRow, "M", "меню")
+
+        local statusKind = "closed"
+        ui.setStatus = function(kind, isOpen)
+                statusKind = kind
+                local text, col
+                if kind == "ready" then
+                        text, col = "ОРУЖИЕ АКТИВНО", THEME.on
+                elseif kind == "busy" then
+                        text, col = "ТРАНСФОРМАЦИЯ…", C.OrangeOn
+                else
+                        text, col = "РУКА ЗАКРЫТА", MUTED
+                end
+                statusText.Text = text
+                uiTween(dot, 0.2, { BackgroundColor3 = col })
+                bigBtn.Text = isOpen and "СЛОЖИТЬ В РУКУ" or "ТРАНСФОРМАЦИЯ"
+        end
+        onAccent(function(c)
+                if statusKind == "ready" then
+                        dot.BackgroundColor3 = c
+                end
+        end)
+        ui.setRig = function(name)
+                rigChip.Text = name
+                rigChip.TextColor3 = (name == "—") and MUTED or THEME.on
+        end
+        ui.progress = function(p)
+                uiTween(progFill, 0.3, { Size = UDim2.fromScale(math.clamp(p, 0, 1), 1) }, Quad, EOut)
+                percent.Text = string.format("%d%%", math.floor(p * 100 + 0.5))
+        end
+
+        --================================================================ страница 2: ПРИЦЕЛ
+        local p2 = newPage()
+        makeToggle(p2, "Прицел по курсору", "рука следит за мышью", "aim")
+        makeToggle(p2, "Корпус к цели", "персонаж поворачивается за камерой", "face")
+        makeToggle(p2, "Лазерный целеуказатель", "тонкий луч из ствола", "laser")
+        makeToggle(p2, "Перекрестие", "рисуется на месте курсора", "crosshair")
+
+        --================================================================ страница 3: ВИД
+        local p3 = newPage()
+
+        local colorHead = make("Frame", {
+                Size = UDim2.new(1, 0, 0, 14),
+                BackgroundTransparency = 1,
+                LayoutOrder = nextOrder(),
+                Parent = p3,
+        })
+        make("TextLabel", {
+                Size = UDim2.new(0.6, 0, 1, 0),
+                BackgroundTransparency = 1,
+                Text = "ЦВЕТ ЭНЕРГИИ",
+                Font = Enum.Font.GothamBold,
+                TextSize = 10,
+                TextColor3 = MUTED,
+                TextXAlignment = Enum.TextXAlignment.Left,
+                Parent = colorHead,
+        })
+        local colorName = make("TextLabel", {
+                AnchorPoint = Vector2.new(1, 0),
+                Position = UDim2.new(1, 0, 0, 0),
+                Size = UDim2.new(0.4, 0, 1, 0),
+                BackgroundTransparency = 1,
+                Text = "",
+                Font = Enum.Font.GothamBold,
+                TextSize = 11,
+                TextXAlignment = Enum.TextXAlignment.Right,
+                Parent = colorHead,
+        })
+
+        local swRow = make("Frame", {
+                Size = UDim2.new(1, 0, 0, 38),
+                BackgroundTransparency = 1,
+                LayoutOrder = nextOrder(),
+                Parent = p3,
+        })
+        make("UIListLayout", {
+                FillDirection = Enum.FillDirection.Horizontal,
+                VerticalAlignment = Enum.VerticalAlignment.Center,
+                Padding = UDim.new(0, 10),
+                SortOrder = Enum.SortOrder.LayoutOrder,
+                Parent = swRow,
+        })
+        local swStrokes = {}
+        for i, th in ipairs(THEMES) do
+                local b = make("TextButton", {
+                        Size = UDim2.fromOffset(34, 34),
+                        BackgroundColor3 = th.color,
+                        Text = "",
+                        AutoButtonColor = false,
+                        LayoutOrder = i,
+                        Parent = swRow,
+                })
+                corner(b, 10)
+                swStrokes[i] = make("UIStroke", { Thickness = 2.5, Color = Color3.new(1, 1, 1), Transparency = 1, Parent = b })
+                b.MouseEnter:Connect(function()
+                        uiTween(b, 0.12, { Size = UDim2.fromOffset(37, 37) })
+                end)
+                b.MouseLeave:Connect(function()
+                        uiTween(b, 0.12, { Size = UDim2.fromOffset(34, 34) })
+                end)
+                b.Activated:Connect(function()
+                        applyTheme(i)
+                end)
+        end
+        onAccent(function(c)
+                colorName.Text = THEMES[THEME.index].name
+                colorName.TextColor3 = c
+                for i, st in ipairs(swStrokes) do
+                        uiTween(st, 0.15, { Transparency = (i == THEME.index) and 0 or 1 })
+                end
+        end)
+
+        makeToggle(p3, "Искры", "эффекты при превращении", "sparks")
+
+        -- ползунок скорости
+        local function makeSlider(parent, text, key, minV, maxV, fmt)
+                local row = make("Frame", {
+                        Size = UDim2.new(1, 0, 0, 54),
+                        BackgroundColor3 = CARD,
+                        LayoutOrder = nextOrder(),
+                        Parent = parent,
+                })
+                corner(row, 11)
+                make("TextLabel", {
+                        Position = UDim2.new(0, 12, 0, 6),
+                        Size = UDim2.new(1, -90, 0, 18),
+                        BackgroundTransparency = 1,
+                        Text = text,
+                        Font = Enum.Font.GothamMedium,
+                        TextSize = 13,
+                        TextColor3 = TEXT,
+                        TextXAlignment = Enum.TextXAlignment.Left,
+                        Parent = row,
+                })
+                local valLbl = make("TextLabel", {
+                        AnchorPoint = Vector2.new(1, 0),
+                        Position = UDim2.new(1, -12, 0, 6),
+                        Size = UDim2.fromOffset(70, 18),
+                        BackgroundTransparency = 1,
+                        Font = Enum.Font.GothamBold,
+                        TextSize = 13,
+                        TextXAlignment = Enum.TextXAlignment.Right,
+                        Parent = row,
+                })
+                local track = make("Frame", {
+                        Position = UDim2.new(0, 12, 0, 36),
+                        Size = UDim2.new(1, -24, 0, 6),
+                        BackgroundColor3 = OFFTRACK,
+                        BorderSizePixel = 0,
+                        Parent = row,
+                })
+                round(track)
+                local fill = make("Frame", { Size = UDim2.fromScale(0, 1), BorderSizePixel = 0, Parent = track })
+                round(fill)
+                local knob = make("Frame", {
+                        AnchorPoint = Vector2.new(0.5, 0.5),
+                        Position = UDim2.new(0, 0, 0.5, 0),
+                        Size = UDim2.fromOffset(16, 16),
+                        BackgroundColor3 = Color3.fromRGB(240, 244, 248),
+                        Parent = track,
+                })
+                round(knob)
+                local knobStroke = make("UIStroke", { Thickness = 2, Parent = knob })
+                local hit = make("TextButton", {
+                        Position = UDim2.new(0, 0, 0, 26),
+                        Size = UDim2.new(1, 0, 0, 26),
+                        BackgroundTransparency = 1,
+                        Text = "",
+                        Parent = row,
+                })
+
+                local function render()
+                        local alpha = (SETTINGS[key] - minV) / (maxV - minV)
+                        fill.Size = UDim2.fromScale(alpha, 1)
+                        knob.Position = UDim2.new(alpha, 0, 0.5, 0)
+                        valLbl.Text = string.format(fmt or "×%.2f", SETTINGS[key])
+                end
+                local sliding = false
+                local function setFromX(x)
+                        local alpha = math.clamp((x - track.AbsolutePosition.X) / math.max(track.AbsoluteSize.X, 1), 0, 1)
+                        SETTINGS[key] = math.floor((minV + (maxV - minV) * alpha) / 0.05 + 0.5) * 0.05
+                        render()
+                end
+                hit.InputBegan:Connect(function(input)
+                        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+                                sliding = true
+                                setFromX(input.Position.X)
+                        end
+                end)
+                UserInputService.InputChanged:Connect(function(input)
+                        if sliding and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+                                setFromX(input.Position.X)
+                        end
+                end)
+                UserInputService.InputEnded:Connect(function(input)
+                        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+                                sliding = false
+                        end
+                end)
+                onAccent(function(c)
+                        fill.BackgroundColor3 = c
+                        valLbl.TextColor3 = c
+                        knobStroke.Color = c
+                end)
+                render()
+        end
+        makeSlider(p3, "Скорость трансформации", "speed", 0.5, 2)
+        makeSlider(p3, "Громкость звуков", "sfx", 0, 1, "%.0f%%")
+        makeToggle(p3, "Вид от 1 лица", "видны рука и ноги, торс спрятан", "fpView")
+
+        --================================================================ перекрестие
+        local cgui = make("ScreenGui", {
+                Name = "RickRoboArmCrosshair",
+                ResetOnSpawn = false,
+                IgnoreGuiInset = true,
+                DisplayOrder = 60,
+                Parent = playerGui,
+        })
+        local cross = make("Frame", {
+                AnchorPoint = Vector2.new(0.5, 0.5),
+                Size = UDim2.fromOffset(46, 46),
+                BackgroundTransparency = 1,
+                Visible = false,
+                Parent = cgui,
+        })
+        local ring = make("Frame", { Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, Parent = cross })
+        round(ring)
+        local ringStroke = make("UIStroke", { Thickness = 2, Transparency = 0.15, Parent = ring })
+        local spinner = make("Frame", { Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, Parent = cross })
+        local tickFrames = {}
+        local tickDefs = {
+                { UDim2.fromOffset(2, 8), UDim2.new(0.5, -1, 0, -4) },
+                { UDim2.fromOffset(2, 8), UDim2.new(0.5, -1, 1, -4) },
+                { UDim2.fromOffset(8, 2), UDim2.new(0, -4, 0.5, -1) },
+                { UDim2.fromOffset(8, 2), UDim2.new(1, -4, 0.5, -1) },
+        }
+        for _, d in ipairs(tickDefs) do
+                table.insert(tickFrames, make("Frame", { Size = d[1], Position = d[2], BorderSizePixel = 0, Parent = spinner }))
+        end
+        local crossDot = make("Frame", {
+                AnchorPoint = Vector2.new(0.5, 0.5),
+                Position = UDim2.fromScale(0.5, 0.5),
+                Size = UDim2.fromOffset(4, 4),
+                BorderSizePixel = 0,
+                Parent = cross,
+        })
+        round(crossDot)
+        onAccent(function(c)
+                ringStroke.Color = c
+                crossDot.BackgroundColor3 = c
+                for _, f in ipairs(tickFrames) do
+                        f.BackgroundColor3 = c
+                end
+        end)
+
+        local lastShow = false
+        ui.crosshair = function(show, dt)
+                if show ~= lastShow then
+                        lastShow = show
+                        cross.Visible = show
+                        UserInputService.MouseIconEnabled = not show
+                end
+                if show then
+                        local pos
+                        if UserInputService.MouseEnabled then
+                                pos = UserInputService:GetMouseLocation()
+                        else
+                                pos = workspace.CurrentCamera.ViewportSize / 2
+                        end
+                        cross.Position = UDim2.fromOffset(pos.X, pos.Y)
+                        spinner.Rotation = (spinner.Rotation + dt * 70) % 360
+                end
+        end
+
+        ui.tick = function()
+                local t = os.clock()
+                strokeGrad.Rotation = (t * 45) % 360
+                portalGrad.Rotation = (t * 160) % 360
+                local s = 10 + math.sin(t * 3) * 2
+                portalDot.Size = UDim2.fromOffset(s, s)
+        end
+
+        -- клавиша M — свернуть / развернуть меню
+        UserInputService.InputBegan:Connect(function(input, processed)
+                if not processed and input.KeyCode == CONFIG.MenuKey then
+                        setExpanded(not expanded)
+                end
+        end)
+
+        ui.destroy = function()
+                UserInputService.MouseIconEnabled = true
+                gui:Destroy()
+                cgui:Destroy()
+        end
+
+        -- старт: первая вкладка, плавный выезд окна
+        selectTab(1)
+        ui.setStatus("closed", false)
+        ui.setRig("—")
+        ui.progress(0)
+        uiTween(window, 0.7, { Position = UDim2.new(0, 18, 0.5, 0) }, Enum.EasingStyle.Back, EOut)
+end
+
+--------------------------------------------------------------------
+-- ФЛИНГ (v8): бросок игрока столкновением тел
+-- Свой персонаж каждый кадр телепортируется внутрь цели и получает
+-- гигантскую скорость: Roblox доверяет физике владельца персонажа,
+-- поэтому цель получает огромный импульс и улетает.
+--------------------------------------------------------------------
+local flingBusy = false
+local flingCancel = false
+local flingLastT = -1e9
+
+local function flingCharacter(targetChar, maxTime)
+        maxTime = maxTime or CONFIG.FlingMaxTime
+        if flingBusy then
+                return false
+        end
+
+        local char = player.Character
+        local hum = char and char:FindFirstChildOfClass("Humanoid")
+        local root = char and char:FindFirstChild("HumanoidRootPart")
+        local tHum = targetChar and targetChar:FindFirstChildOfClass("Humanoid")
+        local tPart = targetChar
+                and (targetChar:FindFirstChild("HumanoidRootPart")
+                        or targetChar:FindFirstChild("Head")
+                        or targetChar:FindFirstChildWhichIsA("BasePart"))
+        if not (root and hum and hum.Health > 0 and tHum and tHum.Health > 0 and tPart) then
+                return false
+        end
+        if tHum.Sit then
+                return false
+        end
+
+        flingBusy, flingCancel = true, false
+
+        -- маркер на цели: подсветка + надпись
+        local hl = Instance.new("Highlight")
+        hl.FillColor = THEME.on
+        hl.OutlineColor = Color3.new(1, 1, 1)
+        hl.FillTransparency = 0.7
+        hl.Parent = targetChar
+
+        local bb = Instance.new("BillboardGui")
+        bb.Name = "RickFlingMark"
+        bb.Size = UDim2.fromOffset(140, 30)
+        bb.StudsOffset = Vector3.new(0, 3, 0)
+        bb.AlwaysOnTop = true
+        bb.Parent = tPart
+        local lbl = Instance.new("TextLabel")
+        lbl.Size = UDim2.fromScale(1, 1)
+        lbl.BackgroundTransparency = 1
+        lbl.Font = Enum.Font.GothamBlack
+        lbl.TextSize = 18
+        lbl.TextColor3 = THEME.on
+        lbl.TextStrokeTransparency = 0.25
+        lbl.Text = "FLINGING ↓"
+        lbl.Parent = bb
+
+        local savedPivot = char:GetPivot()
+        local savedAutoRotate = hum.AutoRotate
+        local savedFallen = workspace.FallenPartsDestroyHeight
+        local savedSeated = hum:GetStateEnabled(Enum.HumanoidStateType.Seated)
+
+        local bv = Instance.new("BodyVelocity")
+        bv.Velocity = Vector3.zero
+        bv.MaxForce = Vector3.new(9e9, 9e9, 9e9)
+        bv.Parent = root
+
+        hum.AutoRotate = false
+        local fallenDisabled = pcall(function()
+                workspace.FallenPartsDestroyHeight = 0 / 0
+        end)
+        pcall(hum.SetStateEnabled, hum, Enum.HumanoidStateType.Seated, false)
+
+        playSfx(SFX.Servo, 0.8, 1.2)
+        playSfx(SFX.Hiss, 0.6, 1.3)
+
+        local started, launchOrigin, launched = os.clock(), tPart.Position, false
+
+        local function escaped()
+                if not tPart.Parent then
+                        return false
+                end
+                local d = (tPart.Position - launchOrigin).Magnitude
+                local s = tPart.AssemblyLinearVelocity.Magnitude
+                return tPart.Position.Y <= savedFallen + 30 or d > 350 or (d > 120 and s > 200)
+        end
+
+        local function place(offset, rot)
+                local cf = CFrame.new(tPart.Position) * offset * rot
+                root.CFrame = cf
+                char:PivotTo(cf)
+                root.AssemblyLinearVelocity = Vector3.new(9e7, 9e8, 9e7)
+                root.AssemblyAngularVelocity = Vector3.new(9e8, 9e8, 9e8)
+        end
+
+        local ok = pcall(function()
+                local angle = 0
+                while os.clock() - started < maxTime and not flingCancel do
+                        if not (root.Parent and hum.Health > 0 and tPart.Parent and tHum.Health > 0) then
+                                break
+                        end
+                        if escaped() then
+                                launched = true
+                                break
+                        end
+                        local speed = tPart.AssemblyLinearVelocity.Magnitude
+                        angle += 100
+                        local steps
+                        if speed < 50 then
+                                local lead = tHum.MoveDirection * speed / 1.25
+                                local rot = CFrame.Angles(math.rad(angle), 0, 0)
+                                steps = {
+                                        { CFrame.new(0, 1.5, 0) + lead, rot },
+                                        { CFrame.new(0, -1.5, 0) + lead, rot },
+                                        { CFrame.new(0, 1.5, 0) + lead, rot },
+                                        { CFrame.new(0, -1.5, 0) + lead, rot },
+                                        { CFrame.new(0, 1.5, 0) + tHum.MoveDirection, rot },
+                                        { CFrame.new(0, -1.5, 0) + tHum.MoveDirection, rot },
+                                }
+                        else
+                                local flat, quarter = CFrame.new(), CFrame.Angles(math.rad(90), 0, 0)
+                                steps = {
+                                        { CFrame.new(0, 1.5, tHum.WalkSpeed), quarter },
+                                        { CFrame.new(0, -1.5, -tHum.WalkSpeed), flat },
+                                        { CFrame.new(0, 1.5, tHum.WalkSpeed), quarter },
+                                        { CFrame.new(0, -1.5, 0), quarter },
+                                        { CFrame.new(0, -1.5, 0), flat },
+                                        { CFrame.new(0, -1.5, 0), quarter },
+                                        { CFrame.new(0, -1.5, 0), flat },
+                                }
+                        end
+                        for _, s in ipairs(steps) do
+                                place(s[1], s[2])
+                                task.wait()
+                                if flingCancel or escaped() then
+                                        launched = not flingCancel
+                                        break
+                                end
+                        end
+                        if launched then
+                                break
+                        end
+                end
+        end)
+
+        if launched then
+                playSfx(SFX.Piston, 1.1, 0.62)
+                playSfx(SFX.Plasma, 0.9, 0.5)
+                shake(1.6)
+                fovPunch(7, 0.05, 0.4)
+        end
+
+        if bv.Parent then
+                bv:Destroy()
+        end
+        pcall(hum.SetStateEnabled, hum, Enum.HumanoidStateType.Seated, savedSeated)
+        if root.Parent and hum.Health > 0 then
+                pcall(function()
+                        for _ = 1, 6 do
+                                char:PivotTo(savedPivot * CFrame.new(0, 0.5, 0))
+                                for _, p in ipairs(char:GetChildren()) do
+                                        if p:IsA("BasePart") then
+                                                p.AssemblyLinearVelocity = Vector3.zero
+                                                p.AssemblyAngularVelocity = Vector3.zero
+                                        end
+                                end
+                                if (root.Position - savedPivot.Position).Magnitude < 25 then
+                                        break
+                                end
+                                RunService.Heartbeat:Wait()
+                        end
+                        hum.AutoRotate = savedAutoRotate
+                        hum:ChangeState(Enum.HumanoidStateType.GettingUp)
+                end)
+        end
+        if fallenDisabled then
+                pcall(function()
+                        workspace.FallenPartsDestroyHeight = savedFallen
+                end)
+        end
+        if hl.Parent then
+                hl:Destroy()
+        end
+        if bb.Parent then
+                bb:Destroy()
+        end
+        flingBusy = false
+        return ok and launched
+end
+
+-- кого флингим: игрок под курсором, иначе ближайший живой перед нами
+local function findFlingTarget()
+        local char = player.Character
+        local root = char and char:FindFirstChild("HumanoidRootPart")
+        if not root then
+                return nil
+        end
+
+        local cam = workspace.CurrentCamera
+        if cam then
+                local vp = UserInputService.MouseEnabled and UserInputService:GetMouseLocation()
+                        or cam.ViewportSize / 2
+                local ray = cam:ViewportPointToRay(vp.X, vp.Y)
+                local rp = RaycastParams.new()
+                rp.FilterType = Enum.RaycastFilterType.Exclude
+                rp.FilterDescendantsInstances = { char }
+                local hit = workspace:Raycast(ray.Origin, ray.Direction * CONFIG.FlingRange, rp)
+                local node = hit and hit.Instance
+                while node and node ~= workspace do
+                        if node:IsA("Model") and node:FindFirstChildOfClass("Humanoid") then
+                                return node
+                        end
+                        node = node.Parent
+                end
+        end
+
+        local best, bestD = nil, CONFIG.FlingFallback
+        for _, pl in ipairs(Players:GetPlayers()) do
+                if pl ~= player then
+                        local pc = pl.Character
+                        local pr = pc and pc:FindFirstChild("HumanoidRootPart")
+                        local ph = pc and pc:FindFirstChildOfClass("Humanoid")
+                        if pr and ph and ph.Health > 0 then
+                                local off = pr.Position - root.Position
+                                local d = off.Magnitude
+                                if d < bestD and d > 0.5 and off.Unit:Dot(root.CFrame.LookVector) > 0.3 then
+                                        best, bestD = pc, d
+                                end
+                        end
+                end
+        end
+        return best
+end
+
+-- запуск флинга с защитой от спама: клавиша F и попадания плазмы (v9)
+function startFling(targetChar, fromShot)
+        if flingBusy or os.clock() - flingLastT < CONFIG.FlingCooldown then
+                return
+        end
+        flingLastT = os.clock()
+        if fromShot then
+                playSfx(SFX.Piston, 0.8, 1.05)
+        else
+                playSfx(SFX.LockClick, 0.6, 1.4)
+        end
+        task.spawn(flingCharacter, targetChar, CONFIG.FlingMaxTime)
+end
+
+local function tryFling()
+        local target = findFlingTarget()
+        if target then
+                startFling(target)
+        else
+                playSfx(SFX.LockClick, 0.5, 0.7)
+        end
+end
+
+--------------------------------------------------------------------
+-- ПОДКЛЮЧЕНИЕ
+--------------------------------------------------------------------
+ContextActionService:UnbindAction(CONFIG.ToggleAction)
+ContextActionService:BindAction(CONFIG.ToggleAction, onToggleAction, true, CONFIG.Key, CONFIG.GamepadKey)
+ContextActionService:SetTitle(CONFIG.ToggleAction, CONFIG.ButtonTitle)
+
+ContextActionService:UnbindAction(CONFIG.ModeAction)
+ContextActionService:BindAction(CONFIG.ModeAction, onModeAction, true, CONFIG.ModeKey, CONFIG.ModeGamepad)
+ContextActionService:SetTitle(CONFIG.ModeAction, "РЕЖИМ")
+
+ContextActionService:UnbindAction(CONFIG.FlingAction)
+ContextActionService:BindAction(CONFIG.FlingAction, function(_, inputState)
+        if inputState == Enum.UserInputState.Begin then
+                tryFling()
+        end
+        return Enum.ContextActionResult.Sink
+end, true, CONFIG.FlingKey)
+ContextActionService:SetTitle(CONFIG.FlingAction, "ФЛИНГ")
+
+pcall(function()
+        RunService:UnbindFromRenderStep("RickRoboArmAim")
+end)
+-- части тела для показа от первого лица: голова и торс скрыты (камера внутри
+-- головы, торс перекрывал обзор), аксессуары не трогаем, чтобы не торчали у лица
+local fpChar = nil
+local fpParts = {}
+local function rebuildFpParts()
+        table.clear(fpParts)
+        fpChar = player.Character
+        if not fpChar then
+                return
+        end
+        for _, pp in ipairs(fpChar:GetChildren()) do
+                if pp:IsA("BasePart") then
+                        local n = pp.Name
+                        -- (v11) прячем голову и торс: торс перекрывает обзор от 1 лица;
+                        -- ноги и руки остаются видимыми
+                        if n ~= "Head" and n ~= "Torso" and n ~= "UpperTorso" and n ~= "LowerTorso" then
+                                table.insert(fpParts, pp)
+                        end
+                end
+        end
+end
+
+RunService:BindToRenderStep("RickRoboArmAim", Enum.RenderPriority.Camera.Value + 1, function(dt)
+        local a = arm
+        local aiming = false
+        if a and a.model.Parent then
+                updateAim(a, dt)
+                aiming = a.isOpen and a.pose.Value > 0.9 and SETTINGS.crosshair
+        end
+        ui.tick(dt)
+        ui.crosshair(aiming, dt)
+        applyShake(dt)
+
+        -- (v10) вид от первого лица: Roblox каждый кадр прячет персонажа через
+        -- LocalTransparencyModifier — перебиваем обратно уже после обновления камеры
+        if SETTINGS.fpView then
+                if player.Character ~= fpChar then
+                        rebuildFpParts()
+                end
+                for _, pp in ipairs(fpParts) do
+                        pp.LocalTransparencyModifier = 0
+                end
+                if a and a.model.Parent then
+                        for _, pp in ipairs(a.visible) do
+                                pp.LocalTransparencyModifier = 0
+                        end
+                end
+        end
+end)
+
+-- обнуляем анимацию плеча уже после работы Animator'а, пока рука целится
+table.insert(sysConns, RunService.PreSimulation:Connect(holdShoulder))
+table.insert(sysConns, RunService.PostSimulation:Connect(holdShoulder))
+
+local function onCharacterAdded(char)
+        destroyArm()
+
+        local stale = char:FindFirstChild(CONFIG.ModelName)
+        if stale then
+                stale:Destroy()
+        end
+
+        local humanoid = char:WaitForChild("Humanoid", 10)
+        if humanoid then
+                humanoid.Died:Connect(function()
+                        destroyArm()
+                end)
+        end
+end
+
+table.insert(sysConns, player.CharacterAdded:Connect(onCharacterAdded))
+table.insert(
+        sysConns,
+        player.CharacterRemoving:Connect(function()
+                destroyArm()
+        end)
+)
+if player.Character then
+        task.spawn(onCharacterAdded, player.Character)
+end
+
+script.Destroying:Connect(function()
+        ContextActionService:UnbindAction(CONFIG.ToggleAction)
+        ContextActionService:UnbindAction(CONFIG.ModeAction)
+        ContextActionService:UnbindAction(CONFIG.FlingAction)
+        pcall(function()
+                RunService:UnbindFromRenderStep("RickRoboArmAim")
+        end)
+        for _, c in ipairs(sysConns) do
+                c:Disconnect()
+        end
+        destroyArm()
+        if fxHolder and fxHolder.Parent then
+                fxHolder:Destroy()
+        end
+        if ui.destroy then
+                ui.destroy()
+        end
+end)
+
+local okGui, guiErr = pcall(buildGui)
+if not okGui then
+        warn("[RickRoboArm] GUI: " .. tostring(guiErr))
+end
